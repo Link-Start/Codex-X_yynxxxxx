@@ -8,10 +8,18 @@ import { readImageMetadata } from "./image-metadata.mjs";
 const scriptPath = fileURLToPath(import.meta.url);
 const here = path.dirname(scriptPath);
 const root = path.resolve(here, "..");
-const SKIN_VERSION = "1.2.3";
+const SKIN_VERSION = "1.2.4";
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
 const CDP_ID_PATTERN = /^[A-Za-z0-9._-]{1,200}$/;
 const MAX_ART_BYTES = 16 * 1024 * 1024;
+const CODEX_SURFACE_SELECTORS = Object.freeze({
+  shell: "main.main-surface",
+  sidebar: "aside.app-shell-left-panel",
+  composer: ".composer-surface-chrome",
+  home: '[role="main"]:has([data-testid="home-icon"])',
+  appearance: 'input[name="appearance-theme"]',
+  themePreview: '[data-testid="theme-preview"]',
+});
 let staticPayloadAssets = null;
 
 function parseArgs(argv) {
@@ -203,29 +211,36 @@ async function listAppTargets(port) {
   }
 }
 
-async function probeSession(session) {
+export async function probeSession(session) {
   return session.evaluate(`(() => {
     const markers = {
-      shell: Boolean(document.querySelector('main.main-surface')),
-      sidebar: Boolean(document.querySelector('aside.app-shell-left-panel')),
-      composer: Boolean(document.querySelector('.composer-surface-chrome')),
-      main: Boolean(document.querySelector('[role="main"]')),
+      shell: Boolean(document.querySelector(${JSON.stringify(CODEX_SURFACE_SELECTORS.shell)})),
+      sidebar: Boolean(document.querySelector(${JSON.stringify(CODEX_SURFACE_SELECTORS.sidebar)})),
+      composer: Boolean(document.querySelector(${JSON.stringify(CODEX_SURFACE_SELECTORS.composer)})),
+      main: Boolean(document.querySelector(${JSON.stringify(CODEX_SURFACE_SELECTORS.home)})),
+      settings: Boolean(document.querySelector(${JSON.stringify(CODEX_SURFACE_SELECTORS.appearance)})) ||
+        Boolean(document.querySelector(${JSON.stringify(CODEX_SURFACE_SELECTORS.themePreview)})),
     };
     return {
       title: document.title,
       href: location.href,
       markers,
-      codex: markers.shell && markers.sidebar,
+      codex: location.protocol === 'app:' &&
+        ((markers.shell && markers.sidebar) || markers.main || markers.settings),
     };
   })()`);
 }
 
-async function waitForCodexProbe(session, timeoutMs = 1800) {
+export async function waitForCodexProbe(session, timeoutMs = 1800) {
   const deadline = Date.now() + timeoutMs;
   let probe = null;
   while (Date.now() < deadline) {
-    probe = await probeSession(session);
-    if (probe?.codex) return probe;
+    try {
+      probe = await probeSession(session);
+      if (probe?.codex) return probe;
+    } catch {
+      // Chromium can briefly replace the execution context while Codex boots.
+    }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   return probe;
@@ -246,7 +261,8 @@ async function connectCodexTargets(port, timeoutMs) {
         let session;
         try {
           session = await connectTarget(target, port);
-          const probe = await probeSession(session);
+          const remainingMs = Math.max(50, deadline - Date.now());
+          const probe = await waitForCodexProbe(session, Math.min(1800, remainingMs));
           if (probe?.codex) connected.push({ target, session, probe });
           else session.close();
         } catch (error) {
@@ -255,7 +271,7 @@ async function connectCodexTargets(port, timeoutMs) {
         }
       }
       if (connected.length) return connected;
-      lastError = new Error("No page matched the expected Codex shell markers");
+      lastError = new Error("No page matched the expected Codex surface markers");
     } catch (error) {
       lastError = error;
     }
@@ -517,7 +533,7 @@ async function verifyRemovedSession(session) {
   )()`);
 }
 
-async function verifySession(session) {
+export async function verifySession(session) {
   return session.evaluate(`(() => {
     const box = (node) => {
       if (!node) return null;
@@ -533,6 +549,8 @@ async function verifySession(session) {
     const homeSignal = homeIndicator ?? document.querySelector('[data-feature="game-source"]') ??
       document.querySelector('.group\\\\/home-suggestions');
     const homeRoute = homeSignal?.closest('[role="main"]') ?? null;
+    const settingsAnchor = document.querySelector(${JSON.stringify(CODEX_SURFACE_SELECTORS.appearance)}) ||
+      document.querySelector(${JSON.stringify(CODEX_SURFACE_SELECTORS.themePreview)});
     const home = document.querySelector('[role="main"].dream-skin-home');
     const suggestions = home?.querySelector('.group\\\\/home-suggestions') ?? null;
     const cardBoxes = suggestions ? [...suggestions.querySelectorAll('button')].map(box) : [];
@@ -550,7 +568,10 @@ async function verifySession(session) {
       chromePresent: Boolean(chrome),
       chromePointerEvents: getComputedStyle(chrome || document.body).pointerEvents,
       homeRoute: Boolean(homeRoute),
+      homeRouteBox: box(homeRoute),
       homePresent: Boolean(home),
+      settingsRoute: Boolean(settingsAnchor),
+      settingsAnchor: box(settingsAnchor),
       hero,
       cards: cardBoxes,
       visibleCardCount: visibleCards.length,
@@ -564,9 +585,13 @@ async function verifySession(session) {
         y: document.documentElement.scrollHeight > document.documentElement.clientHeight,
       },
     };
+    const standardSurface = Boolean(result.shell?.visible && result.sidebar?.visible);
+    const routeSurface = Boolean(result.homeRouteBox?.visible || result.settingsAnchor?.visible);
+    const chromePass = result.settingsRoute ||
+      (result.chromePresent && result.chromePointerEvents === 'none');
     const basePass = result.installed && result.version === ${JSON.stringify(SKIN_VERSION)} &&
-      result.stylePresent && result.chromePresent && result.chromePointerEvents === 'none' &&
-      Boolean(result.shell?.visible) && Boolean(result.sidebar?.visible) && !result.documentOverflow.x;
+      result.stylePresent && chromePass && (standardSurface || routeSurface) &&
+      !result.documentOverflow.x;
     // Project selector markup varies across Codex builds — soft requirement.
     const homePass = !result.homeRoute || (
       result.homePresent && result.hero?.visible && result.hero.width >= 280 && result.hero.height >= 120
@@ -688,9 +713,13 @@ export function earlyPayloadFor(payload, revision) {
     const install = () => {
       if (window[generationKey] !== generation) { stop(); return true; }
       if (!document.documentElement) return false;
-      const shell = document.querySelector('main.main-surface');
-      const sidebar = document.querySelector('aside.app-shell-left-panel');
-      if (!shell || !sidebar) return false;
+      if (location.protocol !== "app:") return false;
+      const shell = document.querySelector(${JSON.stringify(CODEX_SURFACE_SELECTORS.shell)});
+      const sidebar = document.querySelector(${JSON.stringify(CODEX_SURFACE_SELECTORS.sidebar)});
+      const home = document.querySelector(${JSON.stringify(CODEX_SURFACE_SELECTORS.home)});
+      const settings = document.querySelector(${JSON.stringify(CODEX_SURFACE_SELECTORS.appearance)}) ||
+        document.querySelector(${JSON.stringify(CODEX_SURFACE_SELECTORS.themePreview)});
+      if (!(shell && sidebar) && !home && !settings) return false;
       stop();
       ${payload};
       window[appliedKey] = generation;

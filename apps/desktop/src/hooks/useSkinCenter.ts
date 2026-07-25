@@ -43,9 +43,11 @@ export function useSkinCenter({
 }: UseSkinCenterOptions) {
   const [state, setState] = React.useState<SkinCenterState | null>(null);
   const [restartRequest, setRestartRequest] = React.useState<SkinRestartRequest | null>(null);
+  const [pauseBusy, setPauseBusy] = React.useState(false);
   const zipInputRef = React.useRef<HTMLInputElement | null>(null);
   const imageInputRef = React.useRef<HTMLInputElement | null>(null);
   const loadedRef = React.useRef(false);
+  const pauseInFlightRef = React.useRef(false);
 
   const load = React.useCallback(async ({
     quiet = false,
@@ -193,7 +195,9 @@ export function useSkinCenter({
   };
 
   const pause = async () => {
-    setActionBusy("pauseSkin");
+    if (pauseInFlightRef.current) return;
+    pauseInFlightRef.current = true;
+    setPauseBusy(true);
     setError("");
     try {
       const result = await invoke<SkinActionResult>("pause_skin_theme");
@@ -203,7 +207,8 @@ export function useSkinCenter({
       setError(String(error));
       void load({ quiet: true });
     } finally {
-      setActionBusy("");
+      pauseInFlightRef.current = false;
+      setPauseBusy(false);
     }
   };
 
@@ -236,6 +241,7 @@ export function useSkinCenter({
   return {
     state,
     restartRequest,
+    pauseBusy,
     zipInputRef,
     imageInputRef,
     refresh,

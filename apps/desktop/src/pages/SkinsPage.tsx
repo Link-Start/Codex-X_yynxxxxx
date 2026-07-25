@@ -46,6 +46,7 @@ export type SkinsPageProps = {
   lang: Lang;
   state: SkinCenterState | null;
   actionBusy: string;
+  pauseBusy: boolean;
   zipInputRef: RefObject<HTMLInputElement>;
   imageInputRef: RefObject<HTMLInputElement>;
   onLoad: MaybeAsyncAction;
@@ -226,6 +227,7 @@ export function SkinsPage({
   lang,
   state,
   actionBusy,
+  pauseBusy,
   zipInputRef,
   imageInputRef,
   onLoad,
@@ -240,6 +242,7 @@ export function SkinsPage({
   const themes = state?.themes ?? [];
   const current = themes.find((theme) => theme.enabled);
   const loading = actionBusy === "loadSkins";
+  const controlsBusy = Boolean(actionBusy) || pauseBusy;
   const runtime = state?.runtime;
   const [categoryManagerOpen, setCategoryManagerOpen] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);
@@ -327,7 +330,7 @@ export function SkinsPage({
               <Button
                 variant="secondary"
                 onClick={() => setEditorOpen(true)}
-                disabled={Boolean(actionBusy)}
+                disabled={controlsBusy}
                 icon={<Pencil size={15} />}
               >
                 {copy.edit}
@@ -335,7 +338,7 @@ export function SkinsPage({
               <Button
                 variant="secondary"
                 onClick={() => run(() => onEnableTheme(selectedTheme.id))}
-                disabled={Boolean(actionBusy) || selectedThemeApplied}
+                disabled={controlsBusy || selectedThemeApplied}
                 icon={actionBusy === `skin:${selectedTheme.id}`
                   ? <Loader2 className="cx-skins-spin" size={15} />
                   : selectedThemeApplied ? <Check size={15} /> : <Play size={15} />}
@@ -347,7 +350,7 @@ export function SkinsPage({
               <Button
                 variant="secondary"
                 onClick={() => run(() => onExportTheme(selectedTheme.id))}
-                disabled={Boolean(actionBusy)}
+                disabled={controlsBusy}
                 icon={actionBusy === `skinExport:${selectedTheme.id}`
                   ? <Loader2 className="cx-skins-spin" size={15} />
                   : <Download size={15} />}
@@ -359,15 +362,15 @@ export function SkinsPage({
           <Button
             variant="secondary"
             onClick={() => run(onPauseTheme)}
-            disabled={Boolean(actionBusy) || !runtime?.supported || !runtime.active}
-            icon={actionBusy === "pauseSkin" ? <Loader2 className="cx-skins-spin" size={15} /> : <Power size={15} />}
+            disabled={pauseBusy}
+            icon={pauseBusy ? <Loader2 className="cx-skins-spin" size={15} /> : <Power size={15} />}
           >
-            {actionBusy === "pauseSkin" ? copy.pausing : copy.pause}
+            {pauseBusy ? copy.pausing : copy.pause}
           </Button>
           <Button
             variant="secondary"
             onClick={() => zipInputRef.current?.click()}
-            disabled={Boolean(actionBusy) || !state}
+            disabled={controlsBusy || !state}
             icon={actionBusy === "importSkinZip" ? <Loader2 className="cx-skins-spin" size={15} /> : <Upload size={15} />}
           >
             {copy.importZip}
@@ -375,7 +378,7 @@ export function SkinsPage({
           <Button
             variant="primary"
             onClick={() => imageInputRef.current?.click()}
-            disabled={Boolean(actionBusy) || !state}
+            disabled={controlsBusy || !state}
             icon={actionBusy === "createSkinFromImage"
               ? <Loader2 className="cx-skins-spin" size={15} />
               : <ImagePlus size={15} />}
@@ -401,7 +404,7 @@ export function SkinsPage({
           variant="ghost"
           size="sm"
           onClick={() => run(onLoad)}
-          disabled={Boolean(actionBusy)}
+          disabled={controlsBusy}
         />
       </section>
 

@@ -799,6 +799,7 @@ function App() {
   const {
     state: skinCenterState,
     restartRequest: skinRestartRequest,
+    pauseBusy: skinPauseBusy,
     zipInputRef: skinZipImportRef,
     imageInputRef: skinImageInputRef,
     refresh: refreshSkinCenter,
@@ -2238,6 +2239,7 @@ function App() {
                   lang={lang}
                   state={skinCenterState}
                   actionBusy={actionBusy}
+                  pauseBusy={skinPauseBusy}
                   zipInputRef={skinZipImportRef}
                   imageInputRef={skinImageInputRef}
                   onLoad={refreshSkinCenter}
