@@ -246,32 +246,13 @@ fn imported_theme_metadata_can_be_edited_without_changing_theme_assets() {
 }
 
 #[test]
-fn builtin_theme_only_updates_surface_opacity() {
-    ensure_builtin_themes().expect("install built-in theme");
-    let before = read_manifest(&themes_root().expect("theme root").join(BUILTIN_SKIN_ID))
-        .expect("read built-in theme");
-    update_skin_theme_settings_inner(
-        BUILTIN_SKIN_ID.to_string(),
-        "Changed".to_string(),
-        "Changed tagline".to_string(),
-        0.48,
-    )
-    .expect("update built-in opacity");
-    let updated = read_manifest(&themes_root().expect("theme root").join(BUILTIN_SKIN_ID))
-        .expect("read updated built-in theme");
-
-    assert_eq!(updated.name, before.name);
-    assert_eq!(updated.tagline, before.tagline);
-    assert_eq!(updated.surface_opacity, Some(0.48));
-}
-
-#[test]
-fn builtin_catalog_contains_only_localized_shiina_theme() {
+fn builtin_catalog_is_not_embedded_but_source_remains_valid() {
     let assets = builtin_skin_assets();
-    assert_eq!(assets.len(), 1);
-    assert_eq!(assets[0].id, BUILTIN_SKIN_ID);
-    let manifest: SkinThemeManifest =
-        serde_json::from_str(assets[0].manifest).expect("parse built-in Shiina manifest");
+    assert!(assets.is_empty());
+    let manifest: SkinThemeManifest = serde_json::from_str(include_str!(
+        "../resources/skin-presets/shiina-mashiro-blossom/theme.json"
+    ))
+    .expect("parse retained Shiina theme source");
     assert_eq!(manifest.id, BUILTIN_SKIN_ID);
     assert_eq!(manifest.name, "椎名真白·樱花画室");
     assert_eq!(manifest.quote, "安静创作，也会发光");

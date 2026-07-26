@@ -63,6 +63,7 @@ const STARTUP_WIZARD_SEEN_KEY = "codexx.startupWizardSeen";
 const ACTIVE_PROVIDER_KEY = "codexx.activeProviderId";
 const PROMPT_INJECTION_MODE_KEY = "codexx.promptInjectionMode";
 const FALLBACK_GITHUB_REPO = "yynxxxxx/Codex-X";
+const SKIN_CENTER_ENABLED = false;
 
 type ThemeTransitionDocument = Document & {
   startViewTransition?: (update: () => void | Promise<void>) => { finished: Promise<void> };
@@ -733,6 +734,7 @@ function App() {
   const t = dict[lang];
   const updater = useAppUpdater();
   const isMacRuntime = navigator.userAgent.toLowerCase().includes("mac");
+  const skinCenterEnabled = SKIN_CENTER_ENABLED;
   const [tab, setTab] = React.useState<Tab>("dashboard");
   const [visitedTabs, setVisitedTabs] = React.useState<Set<Tab>>(() => new Set(["dashboard"]));
   const [providerMode, setProviderMode] = React.useState<ProviderMode>("list");
@@ -795,6 +797,7 @@ function App() {
   const promptCatalogReadyRef = React.useRef(false);
   const promptModeSyncedRef = React.useRef("");
   const skillsMcpLoadedRef = React.useRef(false);
+  const skinShutdownAttemptedRef = React.useRef(false);
   const themeTransitionTimerRef = React.useRef<number | null>(null);
   const {
     state: skinCenterState,
@@ -812,6 +815,7 @@ function App() {
     closeRestart: closeSkinRestart,
     exportTheme: exportSkinTheme,
   } = useSkinCenter({
+    enabled: skinCenterEnabled,
     lang,
     tab,
     ready: Boolean(state),
@@ -949,6 +953,16 @@ function App() {
       return next;
     });
   }, [tab]);
+
+  React.useEffect(() => {
+    if (skinCenterEnabled || skinShutdownAttemptedRef.current) return;
+    skinShutdownAttemptedRef.current = true;
+    void invoke("pause_skin_theme").catch((error) => {
+      setError(lang === "zh"
+        ? `皮肤中心已暂时关闭，但未能自动停用现有皮肤：${String(error)}`
+        : `The skin center is temporarily disabled, but the active skin could not be stopped: ${String(error)}`);
+    });
+  }, [lang, skinCenterEnabled]);
 
   React.useEffect(() => {
     if (providerMode === "form" && !providerTomlDirty) {
@@ -1962,6 +1976,7 @@ function App() {
     <AppShell
       activeTab={tab}
       onTabChange={(nextTab) => {
+        if (nextTab === "skins" && !skinCenterEnabled) return;
         if (!state && nextTab !== "dashboard" && nextTab !== "settings" && nextTab !== "about") {
           setTab("dashboard");
           return;
@@ -1977,6 +1992,7 @@ function App() {
       updatePhase={updater.state.phase}
       onOpenUpdate={() => setUpdatePromptOpen(true)}
       isMacRuntime={isMacRuntime}
+      skinCenterEnabled={skinCenterEnabled}
       contentClassName={cx(
         tab === "sessions" && "cx-app-content--sessions",
         (
@@ -2010,7 +2026,7 @@ function App() {
         }}
       />
       <SkinRestartDialog
-        open={Boolean(skinRestartRequest)}
+        open={skinCenterEnabled && Boolean(skinRestartRequest)}
         lang={lang}
         themeName={skinRestartRequest?.themeName}
         busy={actionBusy.startsWith("skin:")}
@@ -2233,7 +2249,7 @@ function App() {
               />
             )}
 
-            {state && (tab === "skins" || visitedTabs.has("skins")) && (
+            {skinCenterEnabled && state && (tab === "skins" || visitedTabs.has("skins")) && (
               <div className={cx("cx-skins-pane", tab !== "skins" && "page-pane-hidden")}>
                 <SkinsPage
                   lang={lang}

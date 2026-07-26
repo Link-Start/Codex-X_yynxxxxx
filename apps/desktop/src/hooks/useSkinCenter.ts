@@ -25,6 +25,7 @@ function exportFileName(value: string) {
 }
 
 type UseSkinCenterOptions = {
+  enabled: boolean;
   lang: Lang;
   tab: AppTab;
   ready: boolean;
@@ -34,6 +35,7 @@ type UseSkinCenterOptions = {
 };
 
 export function useSkinCenter({
+  enabled,
   lang,
   tab,
   ready,
@@ -53,6 +55,7 @@ export function useSkinCenter({
     quiet = false,
     notify = false,
   }: { quiet?: boolean; notify?: boolean } = {}) => {
+    if (!enabled) return;
     if (!quiet) {
       setActionBusy("loadSkins");
       setError("");
@@ -67,21 +70,21 @@ export function useSkinCenter({
     } finally {
       if (!quiet) setActionBusy("");
     }
-  }, [lang, setActionBusy, setError, setToast]);
+  }, [enabled, lang, setActionBusy, setError, setToast]);
 
   const refresh = React.useCallback(() => load({ notify: true }), [load]);
 
   React.useEffect(() => {
-    if (tab !== "skins" || loadedRef.current) return;
+    if (!enabled || tab !== "skins" || loadedRef.current) return;
     loadedRef.current = true;
     void load();
-  }, [load, tab]);
+  }, [enabled, load, tab]);
 
   React.useEffect(() => {
-    if (!ready || loadedRef.current) return;
+    if (!enabled || !ready || loadedRef.current) return;
     loadedRef.current = true;
     void load({ quiet: true });
-  }, [load, ready]);
+  }, [enabled, load, ready]);
 
   const importZip = async (file?: File | null): Promise<string | null> => {
     if (!file) return null;

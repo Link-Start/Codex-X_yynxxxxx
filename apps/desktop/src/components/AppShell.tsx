@@ -65,6 +65,7 @@ export type AppShellProps = {
   updatePhase?: AppUpdaterPhase;
   onOpenUpdate?: () => void;
   isMacRuntime?: boolean;
+  skinCenterEnabled?: boolean;
   children: ReactNode;
   sidebarFooter?: ReactNode;
   className?: string;
@@ -83,6 +84,7 @@ export function AppShell({
   updatePhase = "idle",
   onOpenUpdate,
   isMacRuntime = false,
+  skinCenterEnabled = true,
   children,
   sidebarFooter,
   className,
@@ -158,7 +160,7 @@ export function AppShell({
         </div>
 
         <nav className="cx-sidebar-nav" aria-label={navigationLabel}>
-          {NAV_ITEMS.map((item) => {
+          {NAV_ITEMS.filter((item) => item.id !== "skins" || skinCenterEnabled).map((item) => {
             const Icon = item.icon;
             const isActive = activeTab === item.id;
 

@@ -17,9 +17,5 @@ pub(crate) fn retired_builtin_skin_ids() -> &'static [&'static str] {
 }
 
 pub(crate) fn builtin_skin_assets() -> &'static [BuiltinSkinAsset] {
-    &[BuiltinSkinAsset {
-        id: BUILTIN_SKIN_ID,
-        manifest: include_str!("../resources/skin-presets/shiina-mashiro-blossom/theme.json"),
-        image: include_bytes!("../resources/skin-presets/shiina-mashiro-blossom/background.png"),
-    }]
+    &[]
 }
