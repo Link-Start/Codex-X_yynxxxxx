@@ -73,10 +73,12 @@ use providers::{
     upsert_provider_on_connection, CcSwitchCodexRow, ProviderUpsertKind, ProviderUpsertMode,
 };
 use providers::{
-    delete_provider_inner, fetch_provider_models_inner, import_ccswitch_codex_providers_inner,
-    list_saved_providers_inner, read_ccswitch_official_auth_inner, save_official_config_inner,
-    save_provider_inner, save_provider_toml_config_inner, switch_official_provider_inner,
-    switch_provider_inner, test_provider_connection_inner, ImportResult, OfficialAuthCandidate,
+    capture_live_chatgpt_config, delete_provider_inner, fetch_provider_models_inner,
+    get_official_config_draft_inner, import_ccswitch_codex_providers_inner,
+    list_saved_providers_inner, read_ccswitch_official_auth_inner, reset_official_provider_inner,
+    restore_official_provider_inner, save_official_config_inner, save_provider_inner,
+    save_provider_toml_config_inner, switch_official_provider_inner, switch_provider_inner,
+    test_provider_connection_inner, ImportResult, OfficialAuthCandidate, OfficialConfigDraft,
     OfficialConfigInput, ProviderConnectionResult, ProviderInput, ProviderModelsResult,
     ProviderTomlInput, SavedProvider,
 };
@@ -857,6 +859,9 @@ async fn delete_saved_provider(id: String) -> Result<()> {
 async fn get_codex_state(config_dir: Option<String>) -> Result<CodexState> {
     tauri::async_runtime::spawn_blocking(move || {
         let codex_dir = resolve_codex_dir(config_dir)?;
+        // Read-only refreshes only capture high-confidence ChatGPT credentials.
+        // Explicit provider switches also preserve official API-key configs.
+        let _ = capture_live_chatgpt_config(&codex_dir);
         build_state(codex_dir)
     })
     .await
@@ -868,6 +873,31 @@ async fn switch_official_provider(config_dir: Option<String>) -> Result<ActionRe
     tauri::async_runtime::spawn_blocking(move || switch_official_provider_inner(config_dir))
         .await
         .map_err(|e| CodexxError::Config(format!("切换官方配置失败: {e}")))?
+}
+
+#[tauri::command]
+async fn get_official_config_draft(
+    config_dir: Option<String>,
+) -> Result<Option<OfficialConfigDraft>> {
+    tauri::async_runtime::spawn_blocking(move || get_official_config_draft_inner(config_dir))
+        .await
+        .map_err(|e| CodexxError::Config(format!("读取官方配置快照失败: {e}")))?
+}
+
+#[tauri::command]
+async fn restore_official_provider(config_dir: Option<String>) -> Result<ActionResult> {
+    tauri::async_runtime::spawn_blocking(move || restore_official_provider_inner(config_dir))
+        .await
+        .map_err(|e| CodexxError::Config(format!("还原官方配置失败: {e}")))?
+}
+
+#[tauri::command]
+async fn reset_official_provider(input: OfficialConfigInput) -> Result<ActionResult> {
+    tauri::async_runtime::spawn_blocking(move || {
+        reset_official_provider_inner(input.config_dir, input.model)
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("新建官方配置失败: {e}")))?
 }
 
 #[tauri::command]
@@ -1196,6 +1226,9 @@ pub fn run() {
             delete_saved_provider,
             get_codex_state,
             switch_official_provider,
+            get_official_config_draft,
+            restore_official_provider,
+            reset_official_provider,
             save_official_config,
             enable_instruction,
             enable_instruction_template,

@@ -7,10 +7,12 @@ import {
   CheckCircle2,
   Eye,
   EyeOff,
+  FilePlus2,
   Loader2,
   PencilLine,
   Plus,
   RefreshCw,
+  RotateCcw,
   Trash2,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -80,6 +82,12 @@ export type ProviderCopy = {
   officialCurrentLabel: string;
   officialAuthLabel: string;
   officialSaveLabel: string;
+  restoreOfficialLabel: string;
+  resetOfficialLabel: string;
+  resetOfficialTitle: string;
+  resetOfficialDescription: string;
+  resetOfficialCancelLabel: string;
+  resetOfficialConfirmLabel: string;
   cancelLabel: string;
   formEyebrow: string;
   formAddTitle: string;
@@ -125,6 +133,7 @@ export type ProvidersPageProps = {
   editingProviderId: string | null;
   providerForm: ProviderFormValue;
   officialForm: OfficialFormValue;
+  officialAuthRef?: Ref<HTMLTextAreaElement>;
   officialInfo: ProviderOfficialInfo;
   providerAuthPreview: ReactNode;
   providerTomlDraft: string;
@@ -134,6 +143,8 @@ export type ProvidersPageProps = {
   fetchingModels: boolean;
   onImportCcSwitch: () => void;
   onAddProvider: () => void;
+  onRestoreOfficial: () => void;
+  onResetOfficial: () => void;
   onEnableProvider: (row: ProviderRow) => void;
   onTestProvider: (row: ProviderRow) => void;
   onEditProvider: (row: ProviderRow) => void;
@@ -220,11 +231,12 @@ function ListPage({
   actionBusy,
   onImportCcSwitch,
   onAddProvider,
+  onRestoreOfficial,
   onEnableProvider,
   onTestProvider,
   onEditProvider,
   onDeleteProvider,
-}: Pick<ProvidersPageProps, "copy" | "providerRows" | "loading" | "testingId" | "actionBusy" | "onImportCcSwitch" | "onAddProvider" | "onEnableProvider" | "onTestProvider" | "onEditProvider" | "onDeleteProvider">) {
+}: Pick<ProvidersPageProps, "copy" | "providerRows" | "loading" | "testingId" | "actionBusy" | "onImportCcSwitch" | "onAddProvider" | "onRestoreOfficial" | "onEnableProvider" | "onTestProvider" | "onEditProvider" | "onDeleteProvider">) {
   const [providerToDelete, setProviderToDelete] = useState<ProviderRow | null>(null);
   const [deleting, setDeleting] = useState(false);
 
@@ -298,6 +310,14 @@ function ListPage({
                 >
                   {copy.enableLabel}
                 </button>
+                {row.source === "official" && (
+                  <ActionIconButton
+                    icon={RotateCcw}
+                    label={copy.restoreOfficialLabel}
+                    onClick={onRestoreOfficial}
+                    disabled={loading}
+                  />
+                )}
                 {row.testable !== false && (
                   <ActionIconButton
                     icon={isTesting ? Loader2 : Activity}
@@ -373,13 +393,23 @@ function ModeHeader({ eyebrow, title, description, cancelLabel, onCancel }: { ey
 function OfficialForm({
   copy,
   officialForm,
+  officialAuthRef,
   officialInfo,
   loading,
   onCancelMode,
   onOfficialModelChange,
   onOfficialAuthChange,
   onSaveOfficial,
-}: Pick<ProvidersPageProps, "copy" | "officialForm" | "officialInfo" | "loading" | "onCancelMode" | "onOfficialModelChange" | "onOfficialAuthChange" | "onSaveOfficial">) {
+  onRestoreOfficial,
+  onResetOfficial,
+}: Pick<ProvidersPageProps, "copy" | "officialForm" | "officialAuthRef" | "officialInfo" | "loading" | "onCancelMode" | "onOfficialModelChange" | "onOfficialAuthChange" | "onSaveOfficial" | "onRestoreOfficial" | "onResetOfficial">) {
+  const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
+
+  const confirmReset = () => {
+    setResetConfirmOpen(false);
+    onResetOfficial();
+  };
+
   return (
     <>
       <ModeHeader eyebrow={copy.officialEyebrow} title={copy.officialTitle} description={copy.officialHint} cancelLabel={copy.cancelLabel} onCancel={onCancelMode} />
@@ -393,16 +423,42 @@ function OfficialForm({
       </div>
       <Field label={copy.officialAuthLabel} className="cx-providers-editor-field">
         <textarea
+          ref={officialAuthRef}
           className="cx-providers-code-editor cx-providers-auth-editor"
           value={officialForm.authJson}
           onChange={(event) => onOfficialAuthChange(event.target.value)}
-          wrap="off"
+          wrap="soft"
           spellCheck={false}
         />
       </Field>
-      <div className="cx-providers-form-actions cx-providers-form-actions--save">
+      <div className="cx-providers-form-actions cx-providers-form-actions--save cx-providers-official-actions">
+        <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={onRestoreOfficial} disabled={loading}>
+          <RotateCcw size={15} aria-hidden="true" />{copy.restoreOfficialLabel}
+        </button>
+        <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={() => setResetConfirmOpen(true)} disabled={loading}>
+          <FilePlus2 size={15} aria-hidden="true" />{copy.resetOfficialLabel}
+        </button>
         <button type="button" className="cx-providers-button cx-providers-button--primary" onClick={onSaveOfficial} disabled={loading}><CheckCircle2 size={15} aria-hidden="true" />{copy.officialSaveLabel}</button>
       </div>
+      <ModalShell
+        open={resetConfirmOpen}
+        onClose={() => setResetConfirmOpen(false)}
+        title={copy.resetOfficialTitle}
+        description={copy.resetOfficialDescription}
+        size="sm"
+        closeLabel={copy.resetOfficialCancelLabel}
+        footer={(
+          <>
+            <Button variant="secondary" onClick={() => setResetConfirmOpen(false)} data-initial-focus>{copy.resetOfficialCancelLabel}</Button>
+            <Button variant="danger" icon={<FilePlus2 size={16} />} onClick={confirmReset}>{copy.resetOfficialConfirmLabel}</Button>
+          </>
+        )}
+      >
+        <div className="cx-provider-delete-warning">
+          <span aria-hidden="true"><AlertTriangle size={22} /></span>
+          <strong>auth.json</strong>
+        </div>
+      </ModalShell>
     </>
   );
 }

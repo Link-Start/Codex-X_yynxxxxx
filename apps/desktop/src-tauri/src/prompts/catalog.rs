@@ -140,6 +140,42 @@ pub(crate) fn stable_remote_prompt_id(filename: &str) -> String {
 }
 
 fn prompt_display_meta(filename: &str) -> (String, String, String) {
+    let curated = match filename.to_ascii_lowercase().as_str() {
+        "software-development-maintainer.md" => Some((
+            "长期维护工程师",
+            "正式项目的最小改动、复用、测试与安全规范",
+            "软件开发",
+        )),
+        "software-development-debugging.md" => Some((
+            "系统化调试与根因修复",
+            "从稳定复现、证据采集到最小修复与回归验证",
+            "软件开发",
+        )),
+        "software-development-code-review.md" => Some((
+            "严格代码审查",
+            "按严重级别发现缺陷、回归、安全风险与测试缺口",
+            "软件开发",
+        )),
+        "writing-clarity-editor.md" => Some((
+            "清晰表达与润色",
+            "保留原意与事实，优化中文或英文的结构、语气和可读性",
+            "写作辅助",
+        )),
+        "writing-technical-docs.md" => Some((
+            "技术文档写作",
+            "基于代码和事实编写 README、指南、API 与变更文档",
+            "写作辅助",
+        )),
+        "writing-structured-draft.md" => Some((
+            "结构化长文起草",
+            "把零散材料整理为提纲清晰、论证连贯的完整初稿",
+            "写作辅助",
+        )),
+        _ => None,
+    };
+    if let Some((title, subtitle, badge)) = curated {
+        return (title.to_string(), subtitle.to_string(), badge.to_string());
+    }
     if let Some(meta) = bundled_prompt_metas()
         .into_iter()
         .find(|item| item.filename.eq_ignore_ascii_case(filename))
@@ -851,6 +887,30 @@ mod tests {
         assert!(remote.cached);
         drop(conn);
         std::fs::remove_file(database_path).expect("remove prompt cache database");
+    }
+
+    #[test]
+    fn curated_remote_prompts_have_user_facing_metadata() {
+        assert_eq!(
+            prompt_display_meta("software-development-maintainer.md"),
+            (
+                "长期维护工程师".to_string(),
+                "正式项目的最小改动、复用、测试与安全规范".to_string(),
+                "软件开发".to_string(),
+            )
+        );
+        assert_eq!(
+            prompt_display_meta("writing-technical-docs.md").2,
+            "写作辅助"
+        );
+    }
+
+    #[test]
+    fn curated_remote_prompt_ids_retain_category_prefixes() {
+        assert!(stable_remote_prompt_id("software-development-debugging.md")
+            .starts_with("github-software-development-debugging-"));
+        assert!(stable_remote_prompt_id("writing-clarity-editor.md")
+            .starts_with("github-writing-clarity-editor-"));
     }
 
     #[test]

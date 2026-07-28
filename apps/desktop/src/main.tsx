@@ -34,6 +34,7 @@ import type {
   InstructionMode,
   InstructionTemplate,
   Lang,
+  OfficialConfigDraft,
   PromptInjectionMode,
   ProviderConnectionResult,
   ProviderModel,
@@ -190,7 +191,7 @@ const dict = {
       local: "本地保存",
       noProviders: "还没有供应商，点击右上角 + 添加。",
       officialEdit: "OpenAI Official 编辑",
-      officialHint: "官方配置不使用第三方路由；这里可以编辑官方模式下的模型和完整 auth.json（ChatGPT 登录通常包含 access_token / refresh_token / id_token）。",
+      officialHint: "官方配置与当前中转配置独立保存。还原只恢复 Codex-X 官方快照，不会切换当前供应商；切换回官方时会优先使用该快照。",
       officialUrl: "官方入口",
       formAdd: "添加新供应商",
       formEdit: "编辑供应商",
@@ -292,7 +293,7 @@ const dict = {
       local: "Local",
       noProviders: "No provider yet. Click + to add one.",
       officialEdit: "OpenAI Official settings",
-      officialHint: "Official mode does not use third-party routing. You can edit the official model and the full auth.json (ChatGPT login usually contains access_token / refresh_token / id_token).",
+      officialHint: "Official settings are stored separately from the active proxy. Restore only recovers the Codex-X snapshot without switching providers; switching back uses that snapshot first.",
       officialUrl: "Official URL",
       formAdd: "Add provider",
       formEdit: "Edit provider",
@@ -376,6 +377,14 @@ function getProviderPageCopy(lang: Lang): ProviderCopy {
     officialCurrentLabel: t.provider.current,
     officialAuthLabel: "auth.json (JSON)",
     officialSaveLabel: isChinese ? "保存官方配置" : "Save official config",
+    restoreOfficialLabel: isChinese ? "还原官方配置" : "Restore official config",
+    resetOfficialLabel: isChinese ? "新建官方配置" : "Create official config",
+    resetOfficialTitle: isChinese ? "新建官方配置" : "Create official config",
+    resetOfficialDescription: isChinese
+      ? "这会切换到 OpenAI Official、清除当前 live auth.json，并要求你在 Codex 中重新登录。操作前会自动备份当前配置。"
+      : "This switches to OpenAI Official, removes the live auth.json, and requires a new Codex login. The current files are backed up first.",
+    resetOfficialCancelLabel: isChinese ? "取消" : "Cancel",
+    resetOfficialConfirmLabel: isChinese ? "清除并新建" : "Clear and create",
     cancelLabel: t.provider.cancel,
     formEyebrow: "Provider",
     formAddTitle: t.provider.formAdd,
@@ -724,6 +733,11 @@ function TomlPreview({ text }: { text: string }) {
   );
 }
 
+function fitCodeEditorHeight(editor: HTMLTextAreaElement | null, minHeight: number) {
+  if (!editor) return;
+  editor.style.height = "auto";
+  editor.style.height = `${Math.max(minHeight, editor.scrollHeight + 2)}px`;
+}
 
 function App() {
   const initialLang = (localStorage.getItem(LANG_KEY) as Lang | null) || "zh";
@@ -788,6 +802,7 @@ function App() {
   const autoUpdateCheckedRef = React.useRef(false);
   const promptImportRef = React.useRef<HTMLInputElement | null>(null);
   const skillZipImportRef = React.useRef<HTMLInputElement | null>(null);
+  const officialAuthEditorRef = React.useRef<HTMLTextAreaElement | null>(null);
   const providerTomlEditorRef = React.useRef<HTMLTextAreaElement | null>(null);
   const providerModelsRequestRef = React.useRef(0);
   const promptModeHelpRef = React.useRef<HTMLDivElement | null>(null);
@@ -931,11 +946,19 @@ function App() {
 
   React.useLayoutEffect(() => {
     if (providerMode !== "form") return;
-    const editor = providerTomlEditorRef.current;
-    if (!editor) return;
-    editor.style.height = "0px";
-    editor.style.height = `${Math.max(560, editor.scrollHeight)}px`;
+    fitCodeEditorHeight(providerTomlEditorRef.current, 560);
   }, [providerMode, providerTomlDraft]);
+
+  React.useEffect(() => {
+    if (providerMode !== "official") return;
+    const fit = () => fitCodeEditorHeight(officialAuthEditorRef.current, 420);
+    const frame = window.requestAnimationFrame(fit);
+    window.addEventListener("resize", fit);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("resize", fit);
+    };
+  }, [officialForm.authJson, providerMode]);
 
   React.useEffect(() => {
     if (!state || promptModeSyncedRef.current === state.codexDir) return;
@@ -1558,6 +1581,46 @@ function App() {
       },
     );
 
+  const restoreOfficialProvider = () =>
+    call(
+      async () => {
+        const result = await invoke<ActionResult>("restore_official_provider", { configDir: configDir || null });
+        const draft = await invoke<OfficialConfigDraft | null>("get_official_config_draft", {
+          configDir: configDir || null,
+        });
+        return { result, draft };
+      },
+      ({ result, draft }) => {
+        if (draft) {
+          setOfficialForm({
+            model: draft.model || "gpt-5.5",
+            authJson: draft.authJson,
+          });
+        }
+        handleActionResult(result);
+      },
+    );
+
+  const resetOfficialProvider = () =>
+    call(
+      () => invoke<ActionResult>("reset_official_provider", {
+        input: {
+          configDir: configDir || null,
+          model: officialForm.model,
+          authJson: null,
+        },
+      }),
+      (result) => {
+        localStorage.removeItem(ACTIVE_PROVIDER_KEY);
+        setActiveProviderId("");
+        setOfficialForm({
+          model: result.state.model || officialForm.model || "gpt-5.5",
+          authJson: officialAuthPlaceholder,
+        });
+        handleActionResult(result);
+      },
+    );
+
   const importFromCcSwitch = async () => {
     setActionBusy("importCcSwitch");
     try {
@@ -1793,12 +1856,30 @@ function App() {
 
   const officialAuthPlaceholder = '{\n  "OPENAI_API_KEY": null,\n  "auth_mode": "chatgpt",\n  "tokens": {\n    "access_token": "",\n    "refresh_token": "",\n    "id_token": ""\n  }\n}';
 
-  const openOfficialEdit = () => {
+  const openOfficialEdit = async () => {
+    const liveIsOfficial = !state?.modelProvider || state.modelProvider === "openai";
     setOfficialForm({
       model: state?.model || "gpt-5.5",
-      authJson: state?.authText || officialAuthPlaceholder,
+      authJson: liveIsOfficial && state?.authText ? state.authText : officialAuthPlaceholder,
     });
     setProviderMode("official");
+    setActionBusy("loadOfficialDraft");
+    setError("");
+    try {
+      const draft = await invoke<OfficialConfigDraft | null>("get_official_config_draft", {
+        configDir: configDir || null,
+      });
+      if (draft) {
+        setOfficialForm({
+          model: draft.model || state?.model || "gpt-5.5",
+          authJson: draft.authJson,
+        });
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setActionBusy("");
+    }
   };
 
   const saveOfficialConfig = () =>
@@ -2096,6 +2177,7 @@ function App() {
                   requiresOpenaiAuth: providerForm.requiresOpenaiAuth,
                 }}
                 officialForm={officialForm}
+                officialAuthRef={officialAuthEditorRef}
                 officialInfo={{
                   officialUrl: "https://chatgpt.com/codex",
                   authPath: state.authPath,
@@ -2132,7 +2214,7 @@ function App() {
                 }}
                 onEditProvider={(row) => {
                   if (row.source === "official") {
-                    openOfficialEdit();
+                    void openOfficialEdit();
                     return;
                   }
                   const local = findLocalProviderForRow(row);
@@ -2143,6 +2225,8 @@ function App() {
                   const local = findLocalProviderForRow(row);
                   return local ? removeProvider(local.id) : Promise.resolve(false);
                 }}
+                onRestoreOfficial={restoreOfficialProvider}
+                onResetOfficial={resetOfficialProvider}
                 onCancelMode={() => setProviderMode("list")}
                 onOfficialModelChange={(value) => setOfficialForm((current) => ({ ...current, model: value }))}
                 onOfficialAuthChange={(value) => setOfficialForm((current) => ({ ...current, authJson: value }))}

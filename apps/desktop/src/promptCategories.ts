@@ -22,7 +22,15 @@ type PromptCategoryState = {
 export type ManagedCategoryOptions = {
   storageKey: string;
   defaultCategories: (lang: Lang) => PromptCategory[];
+  defaultCategoryForPrompt?: (promptKey: string) => string | undefined;
 };
+
+export function defaultPromptCategoryForKey(promptKey: string) {
+  const normalized = promptKey.trim().toLowerCase();
+  if (normalized.includes("software-development-")) return "software-development";
+  if (normalized.includes("writing-")) return "writing";
+  return undefined;
+}
 
 function defaultPromptCategories(lang: Lang): PromptCategory[] {
   return lang === "zh"
@@ -41,6 +49,7 @@ function defaultPromptCategories(lang: Lang): PromptCategory[] {
 const PROMPT_CATEGORY_OPTIONS: ManagedCategoryOptions = {
   storageKey: PROMPT_STORAGE_KEY,
   defaultCategories: defaultPromptCategories,
+  defaultCategoryForPrompt: defaultPromptCategoryForKey,
 };
 
 function initialState(lang: Lang, options: ManagedCategoryOptions): PromptCategoryState {
@@ -151,9 +160,11 @@ export function useManagedCategories(lang: Lang, options: ManagedCategoryOptions
   const categoryForPrompt = React.useCallback(
     (promptKey: string) => {
       const assigned = state.assignments[promptKey];
-      return assigned && categoryIds.has(assigned) ? assigned : state.defaultCategoryId;
+      if (assigned && categoryIds.has(assigned)) return assigned;
+      const inferred = options.defaultCategoryForPrompt?.(promptKey);
+      return inferred && categoryIds.has(inferred) ? inferred : state.defaultCategoryId;
     },
-    [categoryIds, state.assignments, state.defaultCategoryId],
+    [categoryIds, options, state.assignments, state.defaultCategoryId],
   );
 
   const setActiveCategoryId = React.useCallback((categoryId: string) => {
@@ -224,11 +235,15 @@ export function useManagedCategories(lang: Lang, options: ManagedCategoryOptions
     if (!promptKey || !categoryIds.has(categoryId)) return;
     setState((current) => {
       const assignments = { ...current.assignments };
-      if (categoryId === current.defaultCategoryId) delete assignments[promptKey];
+      const inferred = options.defaultCategoryForPrompt?.(promptKey);
+      const naturalCategoryId = inferred && categoryIds.has(inferred)
+        ? inferred
+        : current.defaultCategoryId;
+      if (categoryId === naturalCategoryId) delete assignments[promptKey];
       else assignments[promptKey] = categoryId;
       return { ...current, assignments };
     });
-  }, [categoryIds]);
+  }, [categoryIds, options]);
 
   const forgetPrompt = React.useCallback((promptKey: string) => {
     if (!promptKey) return;

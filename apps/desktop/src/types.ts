@@ -94,6 +94,12 @@ export type ActionResult = {
   state: CodexState;
 };
 
+export type OfficialConfigDraft = {
+  authJson: string;
+  model?: string;
+  source: string;
+};
+
 export type ImportResult = {
   imported: number;
   added: number;

@@ -1,4 +1,8 @@
 use super::ccswitch::codex_section_from_table;
+use super::official_auth::{
+    auth_value_has_material, capture_live_official_config, live_config_is_official,
+    mark_official_config_reset, official_config_candidate, save_official_config_snapshot,
+};
 use super::{
     custom_provider_id, experimental_bearer_token_from_doc, reserved_codex_provider_id,
     save_detected_provider_inner, SavedProvider,
@@ -46,6 +50,12 @@ pub(crate) struct OfficialConfigInput {
     pub(crate) config_dir: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) auth_json: Option<String>,
+}
+
+enum OfficialAuthAction {
+    Keep,
+    Replace(Value),
+    Remove,
 }
 
 fn live_auth_api_key(codex_dir: &Path) -> Result<Option<String>> {
@@ -168,7 +178,7 @@ fn set_provider_bearer_token(doc: &mut DocumentMut, token: &str) {
 fn apply_official_config(
     config_dir: Option<String>,
     model: Option<String>,
-    auth_json: Option<String>,
+    auth_action: OfficialAuthAction,
     action: &str,
     message: &str,
 ) -> Result<ActionResult> {
@@ -206,17 +216,13 @@ fn apply_official_config(
 
     write_text(&cfg, &doc.to_string())?;
 
-    if let Some(auth_json) = auth_json
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        let parsed: Value = serde_json::from_str(&auth_json).map_err(|e| json_err(&auth, e))?;
-        if !parsed.is_object() {
-            return Err(CodexxError::Config(
-                "auth.json 必须是 JSON object".to_string(),
-            ));
+    match auth_action {
+        OfficialAuthAction::Keep => {}
+        OfficialAuthAction::Replace(value) => write_json(&auth, &value)?,
+        OfficialAuthAction::Remove if auth.exists() => {
+            fs::remove_file(&auth).map_err(|error| io_err(&auth, error))?;
         }
-        write_json(&auth, &parsed)?;
+        OfficialAuthAction::Remove => {}
     }
 
     let state = build_state(codex_dir)?;
@@ -237,16 +243,35 @@ where
 {
     let codex_dir = resolve_codex_dir(config_dir.clone())?;
     pre_persist(&codex_dir)?;
-    // Switching to official must not overwrite auth.json with a stale cc-switch
-    // ChatGPT token. Codex desktop/CLI owns the live official login flow; after
-    // the user logs in, Codex-X should simply refresh and display ~/.codex/auth.json.
-    apply_official_config(
+    let candidate = official_config_candidate(&codex_dir, false)?;
+    if candidate.is_none() && live_auth_has_material(&codex_dir)? {
+        return Err(CodexxError::Config(
+            "当前 auth.json 来自中转模式，且没有可信的官方认证快照。请使用“还原官方配置”，或使用“新建官方配置”后重新登录".to_string(),
+        ));
+    }
+    let model = candidate
+        .as_ref()
+        .and_then(|candidate| candidate.model.clone());
+    let auth_action = candidate
+        .as_ref()
+        .map(|candidate| OfficialAuthAction::Replace(candidate.auth.clone()))
+        .unwrap_or(OfficialAuthAction::Keep);
+    let source = candidate.as_ref().map(|candidate| candidate.source.clone());
+    let message = source
+        .as_deref()
+        .map(|source| format!("已切换到 OpenAI Official，并恢复：{source}"))
+        .unwrap_or_else(|| "已切换到 OpenAI Official，请在 Codex 中完成登录".to_string());
+    let result = apply_official_config(
         config_dir,
-        None,
-        None,
+        model.clone(),
+        auth_action,
         "switch-official",
-        "已切换到 OpenAI Official（auth.json 保持当前 live 状态）",
-    )
+        &message,
+    )?;
+    if let Some(candidate) = candidate {
+        save_official_config_snapshot(&codex_dir, model, &candidate.auth)?;
+    }
+    Ok(result)
 }
 
 pub(crate) fn switch_official_provider_inner(config_dir: Option<String>) -> Result<ActionResult> {
@@ -258,42 +283,105 @@ pub(crate) fn save_official_config_inner(
     model: Option<String>,
     auth_json: Option<String>,
 ) -> Result<ActionResult> {
-    let codex_dir = resolve_codex_dir(config_dir)?;
+    let codex_dir = resolve_codex_dir(config_dir.clone())?;
     ensure_directory(&codex_dir)?;
-    let cfg = config_path(&codex_dir);
     let auth = auth_path(&codex_dir);
-    let backup_id = create_backup(&codex_dir, "save-official")?;
-
-    let text = read_to_string_if_exists(&cfg)?;
-    let mut doc = parse_toml_document(&cfg, &text)?;
-    if let Some(model) = model
+    let model = model
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        doc["model"] = value(model);
-        write_text(&cfg, &doc.to_string())?;
-    }
-
-    if let Some(auth_json) = auth_json
+        .filter(|s| !s.is_empty());
+    let parsed_auth = if let Some(auth_json) = auth_json
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
     {
         let parsed: Value = serde_json::from_str(&auth_json).map_err(|e| json_err(&auth, e))?;
-        if !parsed.is_object() {
+        if !parsed.is_object() || !auth_value_has_material(&parsed) {
             return Err(CodexxError::Config(
-                "auth.json 必须是 JSON object".to_string(),
+                "官方 auth.json 必须是包含有效认证信息的 JSON object".to_string(),
             ));
         }
-        write_json(&auth, &parsed)?;
+        parsed
+    } else {
+        official_config_candidate(&codex_dir, true)?
+            .map(|candidate| candidate.auth)
+            .ok_or_else(|| {
+                CodexxError::Config("没有可保存的官方认证，请先完成官方登录".to_string())
+            })?
+    };
+
+    if live_config_is_official(&codex_dir)? {
+        let result = apply_official_config(
+            config_dir,
+            model.clone(),
+            OfficialAuthAction::Replace(parsed_auth.clone()),
+            "save-official",
+            "已保存并更新当前 OpenAI Official 配置",
+        )?;
+        save_official_config_snapshot(&codex_dir, model, &parsed_auth)?;
+        return Ok(result);
     }
+
+    let backup_id = create_backup(&codex_dir, "save-official-snapshot")?;
+    save_official_config_snapshot(&codex_dir, model, &parsed_auth)?;
 
     let state = build_state(codex_dir)?;
     Ok(ActionResult {
         ok: true,
-        message: "已保存 OpenAI Official 配置（未切换启用）".to_string(),
+        message: "已保存 OpenAI Official 独立配置，当前中转配置未被改动".to_string(),
         backup_id,
         state,
     })
+}
+
+fn live_auth_has_material(codex_dir: &Path) -> Result<bool> {
+    let path = auth_path(codex_dir);
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let text = fs::read_to_string(&path).map_err(|error| io_err(&path, error))?;
+    let value: Value = serde_json::from_str(&text).map_err(|error| json_err(&path, error))?;
+    Ok(auth_value_has_material(&value))
+}
+
+pub(crate) fn restore_official_provider_inner(config_dir: Option<String>) -> Result<ActionResult> {
+    let codex_dir = resolve_codex_dir(config_dir)?;
+    let candidate = official_config_candidate(&codex_dir, true)?.ok_or_else(|| {
+        CodexxError::Config(
+            "未找到可信的官方认证快照或官方模式历史备份，请新建官方配置后重新登录".to_string(),
+        )
+    })?;
+    let model = candidate.model.clone();
+    let message = format!(
+        "已还原 OpenAI Official 独立配置，当前供应商未切换。认证来源：{}",
+        candidate.source
+    );
+    save_official_config_snapshot(&codex_dir, model, &candidate.auth)?;
+    let state = build_state(codex_dir)?;
+    Ok(ActionResult {
+        ok: true,
+        message,
+        backup_id: None,
+        state,
+    })
+}
+
+pub(crate) fn reset_official_provider_inner(
+    config_dir: Option<String>,
+    model: Option<String>,
+) -> Result<ActionResult> {
+    let codex_dir = resolve_codex_dir(config_dir.clone())?;
+    persist_detected_live_custom_provider(&codex_dir)?;
+    let model = model
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let result = apply_official_config(
+        config_dir,
+        model.clone(),
+        OfficialAuthAction::Remove,
+        "reset-official",
+        "已新建 OpenAI Official 配置，请在 Codex 中重新登录",
+    )?;
+    mark_official_config_reset(&codex_dir, model)?;
+    Ok(result)
 }
 
 pub(crate) fn save_provider_toml_config_with_pre_persist<F>(
@@ -305,6 +393,7 @@ where
 {
     let codex_dir = resolve_codex_dir(input.config_dir.clone())?;
     ensure_directory(&codex_dir)?;
+    capture_live_official_config(&codex_dir)?;
     pre_persist(&codex_dir)?;
     let cfg = config_path(&codex_dir);
     let backup_id = create_backup(&codex_dir, "save-provider-toml")?;
@@ -347,6 +436,7 @@ where
 {
     let codex_dir = resolve_codex_dir(input.config_dir.clone())?;
     ensure_directory(&codex_dir)?;
+    capture_live_official_config(&codex_dir)?;
     pre_persist(&codex_dir)?;
     let cfg = config_path(&codex_dir);
     let backup_id = create_backup(&codex_dir, "switch-provider")?;

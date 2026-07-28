@@ -147,7 +147,7 @@ You can use it to:
 ### 1. Prompt Template Center
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Template_library-5_total-2563eb?style=flat-square" alt="5 templates in the current library" />
+  <img src="https://img.shields.io/badge/Template_library-11_total-2563eb?style=flat-square" alt="11 templates in the current library" />
   <img src="https://img.shields.io/badge/Bundled_offline-5_templates-16a34a?style=flat-square" alt="5 templates bundled for offline use" />
   <img src="https://img.shields.io/badge/GitHub_sync-Automatic_updates-f59e0b?style=flat-square" alt="Automatic GitHub template sync" />
 </p>
@@ -155,7 +155,7 @@ You can use it to:
 > [!TIP]
 > **Ready after installation, automatically expanded when online.**
 >
-> The app bundle includes all 5 current templates for offline use. After launch, it synchronizes updates and newly added templates from GitHub `examples/` in the background, without waiting for the **Prompt** page to open. Successfully synchronized online versions are cached locally and remain available during temporary network outages.
+> The app bundle includes 5 templates for offline use. After launch, it synchronizes 6 additional software-development and writing templates, plus later updates, from GitHub `examples/` in the background without waiting for the **Prompt** page to open. Successfully synchronized online versions are cached locally and remain available during temporary network outages.
 
 <div align="center">
 <table>
@@ -188,6 +188,36 @@ You can use it to:
     <td><a href="examples/%E6%B5%B7%E9%B8%A53.0%E7%A0%B4%E7%94%B2.md"><code>海鸥3.0破甲.md</code></a></td>
     <td align="left">A Chinese technical-operator persona with routing for coding, CTF, reverse engineering, memory, and protocol work</td>
     <td align="center">Bundled offline<br />GitHub updates</td>
+  </tr>
+  <tr>
+    <td><a href="examples/software-development-maintainer.md"><code>software-development-maintainer.md</code></a></td>
+    <td align="left">Long-term maintenance with reuse, minimal changes, safety, testing, and maintainability</td>
+    <td align="center">GitHub sync</td>
+  </tr>
+  <tr>
+    <td><a href="examples/software-development-debugging.md"><code>software-development-debugging.md</code></a></td>
+    <td align="left">Evidence-driven debugging from reliable reproduction to root-cause repair and regression checks</td>
+    <td align="center">GitHub sync</td>
+  </tr>
+  <tr>
+    <td><a href="examples/software-development-code-review.md"><code>software-development-code-review.md</code></a></td>
+    <td align="left">Severity-ranked review of defects, regressions, security risks, and test gaps</td>
+    <td align="center">GitHub sync</td>
+  </tr>
+  <tr>
+    <td><a href="examples/writing-clarity-editor.md"><code>writing-clarity-editor.md</code></a></td>
+    <td align="left">Chinese and English editing that preserves the author's meaning and facts</td>
+    <td align="center">GitHub sync</td>
+  </tr>
+  <tr>
+    <td><a href="examples/writing-technical-docs.md"><code>writing-technical-docs.md</code></a></td>
+    <td align="left">Source-grounded README, guide, API, architecture, and release documentation</td>
+    <td align="center">GitHub sync</td>
+  </tr>
+  <tr>
+    <td><a href="examples/writing-structured-draft.md"><code>writing-structured-draft.md</code></a></td>
+    <td align="left">Turns scattered material into a structured report, proposal, retrospective, or article draft</td>
+    <td align="center">GitHub sync</td>
   </tr>
 </table>
 </div>

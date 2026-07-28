@@ -702,9 +702,12 @@
 }
 
 .cx-providers-auth-editor {
-  overflow: auto;
-  white-space: pre;
-  overflow-wrap: normal;
+  min-height: 420px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-all;
 }
 
 .cx-providers-toml-editor {
@@ -717,6 +720,10 @@
 
 .cx-providers-form-actions--save {
   justify-content: flex-end;
+}
+
+.cx-providers-official-actions {
+  margin-top: 18px;
 }
 
 .cx-providers-spin {

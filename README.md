@@ -127,7 +127,7 @@
 ### 1. 可视化提示词注入中心
 
 <p align="center">
-  <img src="https://img.shields.io/badge/当前模板库-5_套-2563eb?style=flat-square" alt="当前模板库 5 套" />
+  <img src="https://img.shields.io/badge/当前模板库-11_套-2563eb?style=flat-square" alt="当前模板库 11 套" />
   <img src="https://img.shields.io/badge/离线内置-5_套-16a34a?style=flat-square" alt="离线内置 5 套" />
   <img src="https://img.shields.io/badge/GitHub_同步-自动更新-f59e0b?style=flat-square" alt="GitHub 自动同步" />
   <img src="https://img.shields.io/badge/自定义提示词-支持导入_编辑-7c3aed?style=flat-square" alt="支持自定义提示词" />
@@ -136,7 +136,7 @@
 > [!TIP]
 > **安装后就能用，联网后自动补齐，也能维护自己的提示词库。**
 >
-> 安装包离线自带当前全部 5 套模板；软件启动后可同步 GitHub `examples/` 的更新和新增模板。同步成功的在线版本会缓存到本地，临时离线仍可继续使用。你也可以导入自己的 `.md`、新增分类、编辑说明，并像切换插件一样启用或禁用任意提示词。
+> 安装包离线自带 5 套模板；软件启动后会从 GitHub `examples/` 同步另外 6 套软件开发与写作辅助模板，以及后续更新。同步成功的在线版本会缓存到本地，临时离线仍可继续使用。你也可以导入自己的 `.md`、新增分类、编辑说明，并像切换插件一样启用或禁用任意提示词。
 
 Codex-X 现在不只是“几套内置 Prompt”的启动器，而是一个可视化提示词注入与管理工具：
 
@@ -177,6 +177,36 @@ Codex-X 现在不只是“几套内置 Prompt”的启动器，而是一个可�
     <td><a href="examples/%E6%B5%B7%E9%B8%A53.0%E7%A0%B4%E7%94%B2.md"><code>海鸥3.0破甲.md</code></a></td>
     <td align="left">中文技术操作员人格，覆盖 coding、CTF、逆向、内存与协议任务路由</td>
     <td align="center">离线内置<br />GitHub 更新</td>
+  </tr>
+  <tr>
+    <td><a href="examples/software-development-maintainer.md"><code>software-development-maintainer.md</code></a></td>
+    <td align="left">长期维护正式项目，强调复用、最小改动、安全、测试与可维护性</td>
+    <td align="center">GitHub 在线同步</td>
+  </tr>
+  <tr>
+    <td><a href="examples/software-development-debugging.md"><code>software-development-debugging.md</code></a></td>
+    <td align="left">从稳定复现和证据采集推进到根因修复与回归验证</td>
+    <td align="center">GitHub 在线同步</td>
+  </tr>
+  <tr>
+    <td><a href="examples/software-development-code-review.md"><code>software-development-code-review.md</code></a></td>
+    <td align="left">按严重级别审查缺陷、回归、安全风险和测试缺口</td>
+    <td align="center">GitHub 在线同步</td>
+  </tr>
+  <tr>
+    <td><a href="examples/writing-clarity-editor.md"><code>writing-clarity-editor.md</code></a></td>
+    <td align="left">在保留原意和事实的前提下润色中英文表达</td>
+    <td align="center">GitHub 在线同步</td>
+  </tr>
+  <tr>
+    <td><a href="examples/writing-technical-docs.md"><code>writing-technical-docs.md</code></a></td>
+    <td align="left">基于代码与事实编写 README、指南、API 和发布文档</td>
+    <td align="center">GitHub 在线同步</td>
+  </tr>
+  <tr>
+    <td><a href="examples/writing-structured-draft.md"><code>writing-structured-draft.md</code></a></td>
+    <td align="left">将零散材料组织成报告、方案、复盘或文章初稿</td>
+    <td align="center">GitHub 在线同步</td>
   </tr>
 </table>
 </div>

@@ -1,6 +1,7 @@
 mod ccswitch;
 mod connection;
 mod live;
+mod official_auth;
 mod store;
 
 use crate::error::Result;
@@ -27,8 +28,14 @@ pub(crate) use live::{
     switch_official_provider_with_pre_persist, switch_provider_with_pre_persist,
 };
 pub(crate) use live::{
-    save_official_config_inner, save_provider_toml_config_inner, switch_official_provider_inner,
-    switch_provider_inner, OfficialConfigInput, ProviderInput, ProviderTomlInput,
+    reset_official_provider_inner, restore_official_provider_inner, save_official_config_inner,
+    save_provider_toml_config_inner, switch_official_provider_inner, switch_provider_inner,
+    OfficialConfigInput, ProviderInput, ProviderTomlInput,
+};
+#[cfg(test)]
+pub(crate) use official_auth::official_snapshot_path_for_test;
+pub(crate) use official_auth::{
+    capture_live_chatgpt_config, get_official_config_draft_inner, OfficialConfigDraft,
 };
 #[cfg(test)]
 pub(crate) use store::{
