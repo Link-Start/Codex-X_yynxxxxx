@@ -2,6 +2,7 @@ use super::types::SavedPrompt;
 use crate::error::{CodexxError, Result};
 use crate::{now_rfc3339, open_db};
 use rusqlite::params;
+use std::collections::HashSet;
 
 pub(crate) fn normalize_prompt_filename(input: &str, fallback: &str) -> String {
     let raw = input.trim().trim_end_matches(".md");
@@ -107,6 +108,68 @@ pub(crate) fn delete_prompt_inner(id: &str) -> Result<()> {
     Ok(())
 }
 
+fn builtin_prompt_override_from_connection(
+    conn: &rusqlite::Connection,
+    template_id: &str,
+) -> Result<Option<String>> {
+    match conn.query_row(
+        "SELECT content FROM builtin_prompt_overrides WHERE template_id = ?1",
+        [template_id],
+        |row| row.get(0),
+    ) {
+        Ok(content) => Ok(Some(content)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(CodexxError::Database(e.to_string())),
+    }
+}
+
+pub(crate) fn builtin_prompt_override_inner(template_id: &str) -> Result<Option<String>> {
+    let conn = open_db()?;
+    builtin_prompt_override_from_connection(&conn, template_id.trim())
+}
+
+pub(crate) fn builtin_prompt_override_ids_inner() -> Result<HashSet<String>> {
+    let conn = open_db()?;
+    let mut stmt = conn
+        .prepare("SELECT template_id FROM builtin_prompt_overrides")
+        .map_err(|e| CodexxError::Database(e.to_string()))?;
+    let rows = stmt
+        .query_map([], |row| row.get(0))
+        .map_err(|e| CodexxError::Database(e.to_string()))?;
+    rows.map(|row| row.map_err(|e| CodexxError::Database(e.to_string())))
+        .collect()
+}
+
+fn save_builtin_prompt_override_on_connection(
+    conn: &rusqlite::Connection,
+    template_id: &str,
+    content: &str,
+) -> Result<()> {
+    let id = template_id.trim();
+    if id.is_empty() {
+        return Err(CodexxError::Config("提示词模板标识不能为空".to_string()));
+    }
+    if content.trim().is_empty() {
+        return Err(CodexxError::Config("提示词内容不能为空".to_string()));
+    }
+    let now = now_rfc3339();
+    conn.execute(
+        "INSERT INTO builtin_prompt_overrides (template_id, content, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?3)
+         ON CONFLICT(template_id) DO UPDATE SET
+           content = excluded.content,
+           updated_at = excluded.updated_at",
+        params![id, content, now],
+    )
+    .map_err(|e| CodexxError::Database(e.to_string()))?;
+    Ok(())
+}
+
+pub(crate) fn save_builtin_prompt_override_inner(template_id: &str, content: &str) -> Result<()> {
+    let conn = open_db()?;
+    save_builtin_prompt_override_on_connection(&conn, template_id, content)
+}
+
 fn find_saved_prompt_by_content(content: &str) -> Result<Option<SavedPrompt>> {
     let conn = open_db()?;
     let mut stmt = conn
@@ -165,5 +228,85 @@ pub(super) fn find_saved_prompt_by_current_file(
         }
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(CodexxError::Database(e.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn override_connection() -> Connection {
+        let conn = Connection::open_in_memory().expect("open override database");
+        conn.execute_batch(
+            "CREATE TABLE builtin_prompt_overrides (
+                template_id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );",
+        )
+        .expect("create override table");
+        conn
+    }
+
+    #[test]
+    fn builtin_prompt_override_can_be_edited_repeatedly() {
+        let conn = override_connection();
+        save_builtin_prompt_override_on_connection(&conn, "template", "first")
+            .expect("save initial override");
+        save_builtin_prompt_override_on_connection(&conn, "template", "second")
+            .expect("update override");
+
+        assert_eq!(
+            builtin_prompt_override_from_connection(&conn, "template")
+                .expect("read override")
+                .as_deref(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn builtin_prompt_override_rejects_empty_content() {
+        let conn = override_connection();
+        let error = save_builtin_prompt_override_on_connection(&conn, "template", "  \n")
+            .expect_err("reject empty override");
+        assert!(error.to_string().contains("内容不能为空"));
+    }
+
+    #[test]
+    fn builtin_prompt_override_survives_database_reopen() {
+        let database_path = std::env::temp_dir().join(format!(
+            "codexx-prompt-override-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        {
+            let conn = Connection::open(&database_path).expect("open override database");
+            conn.execute_batch(
+                "CREATE TABLE builtin_prompt_overrides (
+                    template_id TEXT PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );",
+            )
+            .expect("create override table");
+            save_builtin_prompt_override_on_connection(&conn, "template", "local content")
+                .expect("save override");
+        }
+
+        let reopened = Connection::open(&database_path).expect("reopen override database");
+        assert_eq!(
+            builtin_prompt_override_from_connection(&reopened, "template")
+                .expect("read persisted override")
+                .as_deref(),
+            Some("local content")
+        );
+        drop(reopened);
+        std::fs::remove_file(database_path).expect("remove override database");
     }
 }

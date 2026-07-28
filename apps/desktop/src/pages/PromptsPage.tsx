@@ -23,6 +23,7 @@ import type { PromptCategoryItem } from "../components/PromptCategoryManager";
 import { Button, IconButton, StatusBadge, Toggle, cx } from "../components/ui";
 import { usePromptCategories } from "../promptCategories";
 import type {
+  BuiltinPromptDetail,
   BuiltinPromptStatus,
   InstructionMode,
   InstructionTemplate,
@@ -53,6 +54,7 @@ export type PromptsPageProps = {
   instructionMode: InstructionMode;
   promptForm: SavedPrompt;
   editingPromptId: string | null;
+  editingBuiltinPrompt: BuiltinPromptDetail | null;
   loading: boolean;
   actionBusy: string;
   promptSyncing: boolean;
@@ -84,6 +86,7 @@ export type PromptsPageProps = {
   onEnableSavedPrompt: (id: string) => void | Promise<void>;
   onDisableExternalPrompt: MaybeAsyncAction;
   onEditPrompt: (prompt: SavedPrompt) => void;
+  onEditBuiltinPrompt: (id: string) => void | Promise<void>;
   onDeletePrompt: (id: string) => void | Promise<void>;
   onPromptFormFieldChange: (field: PromptFormField, value: string) => void;
   onSavePrompt: MaybeAsyncAction;
@@ -129,11 +132,17 @@ function getCopy(lang: Lang) {
         preservedDescription: "用户原有提示词，追加模式下继续生效。",
         existingPrompt: "用户原有指令提示词",
         edit: "编辑",
+        editBuiltin: "查看/编辑本地模板",
         remove: "删除",
         formEyebrow: "CUSTOM PROMPT",
         addFormTitle: "添加提示词",
         editFormTitle: "编辑提示词",
         formDescription: "保存为 Markdown 文件，之后可在列表中单独启用。",
+        builtinFormEyebrow: "LOCAL TEMPLATE",
+        builtinFormTitle: "查看与编辑本地模板",
+        builtinFormDescription: "名称和文件名跟随模板目录；内容修改在下次启用时生效，之后 GitHub 同步将永久跳过这份模板。",
+        locallyModified: "本地已修改",
+        saveLocalChanges: "保存本地修改",
         back: "返回",
         promptDetails: "提示词详情",
         promptName: "提示词名称",
@@ -183,11 +192,17 @@ function getCopy(lang: Lang) {
         preservedDescription: "Existing user prompt preserved by append mode.",
         existingPrompt: "Existing user prompt",
         edit: "Edit",
+        editBuiltin: "View or edit local template",
         remove: "Delete",
         formEyebrow: "CUSTOM PROMPT",
         addFormTitle: "Add prompt",
         editFormTitle: "Edit prompt",
         formDescription: "Save it as Markdown, then enable it separately from the list.",
+        builtinFormEyebrow: "LOCAL TEMPLATE",
+        builtinFormTitle: "View and edit local template",
+        builtinFormDescription: "The name and filename follow the template catalog. Content changes apply on the next activation, then GitHub sync permanently skips this template.",
+        locallyModified: "Locally modified",
+        saveLocalChanges: "Save local changes",
         back: "Back",
         promptDetails: "Prompt details",
         promptName: "Prompt name",
@@ -269,6 +284,7 @@ function PromptFormView({
   lang,
   promptForm,
   editingPromptId,
+  editingBuiltinPrompt,
   loading,
   onInstructionModeChange,
   onPromptFormFieldChange,
@@ -278,6 +294,7 @@ function PromptFormView({
   | "lang"
   | "promptForm"
   | "editingPromptId"
+  | "editingBuiltinPrompt"
   | "loading"
   | "onInstructionModeChange"
   | "onPromptFormFieldChange"
@@ -287,14 +304,15 @@ function PromptFormView({
   const titleId = useId();
   const filenameId = useId();
   const contentId = useId();
+  const isBuiltin = Boolean(editingBuiltinPrompt);
 
   return (
     <div className="cx-prompts-form-page">
       <header className="cx-prompts-header cx-prompts-form-header">
         <div className="cx-prompts-heading">
-          <p><PencilLine size={14} aria-hidden="true" />{copy.formEyebrow}</p>
-          <h2>{editingPromptId ? copy.editFormTitle : copy.addFormTitle}</h2>
-          <span>{copy.formDescription}</span>
+          <p><PencilLine size={14} aria-hidden="true" />{isBuiltin ? copy.builtinFormEyebrow : copy.formEyebrow}</p>
+          <h2>{isBuiltin ? copy.builtinFormTitle : editingPromptId ? copy.editFormTitle : copy.addFormTitle}</h2>
+          <span>{isBuiltin ? copy.builtinFormDescription : copy.formDescription}</span>
         </div>
         <Button
           variant="secondary"
@@ -310,6 +328,9 @@ function PromptFormView({
         <div className="cx-prompts-form-panel-head">
           <FileText size={18} aria-hidden="true" />
           <h3 id={`${titleId}-panel`}>{copy.promptDetails}</h3>
+          {editingBuiltinPrompt?.customized && (
+            <StatusBadge tone="info" dot={false}>{copy.locallyModified}</StatusBadge>
+          )}
         </div>
         <div className="cx-prompts-form-grid">
           <label className="cx-prompts-field" htmlFor={titleId}>
@@ -320,6 +341,7 @@ function PromptFormView({
               value={promptForm.title}
               onChange={(event) => onPromptFormFieldChange("title", event.currentTarget.value)}
               placeholder={copy.promptNamePlaceholder}
+              readOnly={isBuiltin}
               disabled={loading}
               autoComplete="off"
             />
@@ -332,6 +354,7 @@ function PromptFormView({
               value={promptForm.filename}
               onChange={(event) => onPromptFormFieldChange("filename", event.currentTarget.value)}
               placeholder={copy.filenamePlaceholder}
+              readOnly={isBuiltin}
               disabled={loading}
               autoComplete="off"
               spellCheck={false}
@@ -358,7 +381,7 @@ function PromptFormView({
           onClick={() => run(onSavePrompt)}
           disabled={loading}
         >
-          {copy.save}
+          {isBuiltin ? copy.saveLocalChanges : copy.save}
         </Button>
       </div>
     </div>
@@ -370,6 +393,7 @@ export function PromptsPage({
   instructionMode,
   promptForm,
   editingPromptId,
+  editingBuiltinPrompt,
   loading,
   actionBusy,
   promptSyncing,
@@ -382,6 +406,7 @@ export function PromptsPage({
   activeInstructionTitle,
   activeInjectionMode,
   instructionTemplates,
+  builtinPromptStatuses,
   activeBuiltinTemplateId,
   orphanedBuiltinPrompt,
   savedPrompts,
@@ -400,6 +425,7 @@ export function PromptsPage({
   onEnableSavedPrompt,
   onDisableExternalPrompt,
   onEditPrompt,
+  onEditBuiltinPrompt,
   onDeletePrompt,
   onPromptFormFieldChange,
   onSavePrompt,
@@ -412,6 +438,10 @@ export function PromptsPage({
   const importBusy = actionBusy === "importPrompt";
   const [categoryManagerOpen, setCategoryManagerOpen] = useState(false);
   const promptCategories = usePromptCategories(lang);
+  const builtinStatusById = useMemo(
+    () => new Map(builtinPromptStatuses.map((status) => [status.id, status])),
+    [builtinPromptStatuses],
+  );
   const categoryItems = useMemo<PromptCategoryItem[]>(() => [
     ...instructionTemplates.map((template) => ({
       key: promptCategoryKey("builtin", template.id),
@@ -441,11 +471,13 @@ export function PromptsPage({
   if (instructionMode === "form") {
     return (
       <PageTransition pageKey={`prompts:${instructionMode}`}>
-        <section className={cx("cx-prompts-page", "cx-prompts-page--form", className)} aria-label={editingPromptId ? copy.editFormTitle : copy.addFormTitle}>
+        <section className={cx("cx-prompts-page", "cx-prompts-page--form", className)} aria-label={editingBuiltinPrompt ? copy.builtinFormTitle : editingPromptId ? copy.editFormTitle : copy.addFormTitle}>
           <PromptFormView
+            key={editingBuiltinPrompt?.id || editingPromptId || "new"}
             lang={lang}
             promptForm={promptForm}
             editingPromptId={editingPromptId}
+            editingBuiltinPrompt={editingBuiltinPrompt}
             loading={loading}
             onInstructionModeChange={onInstructionModeChange}
             onPromptFormFieldChange={onPromptFormFieldChange}
@@ -605,6 +637,7 @@ export function PromptsPage({
           {instructionTemplates.filter((template) =>
             promptIsVisible(promptCategoryKey("builtin", template.id))).map((template) => {
             const enabled = template.id === activeBuiltinTemplateId;
+            const customized = Boolean(builtinStatusById.get(template.id)?.customized);
             return (
               <PromptRow
                 key={template.id}
@@ -614,10 +647,22 @@ export function PromptsPage({
                 loading={loading}
                 toggleLabel={enabled ? copy.disable : copy.enable}
                 onToggle={() => enabled ? onDisableInstruction() : onEnableBuiltinPrompt(template.id)}
+                actions={(
+                  <div className="cx-prompts-icon-actions">
+                    <IconButton
+                      icon={<PencilLine size={15} />}
+                      label={copy.editBuiltin}
+                      size="sm"
+                      onClick={() => onEditBuiltinPrompt(template.id)}
+                      disabled={loading}
+                    />
+                  </div>
+                )}
               >
-                {enabled && (
+                {(enabled || customized) && (
                   <div className="cx-prompts-row-meta">
-                    <StatusBadge tone="accent" dot={false}>{copy.current} · {activeModeLabel}</StatusBadge>
+                    {enabled && <StatusBadge tone="accent" dot={false}>{copy.current} · {activeModeLabel}</StatusBadge>}
+                    {customized && <StatusBadge tone="info" dot={false}>{copy.locallyModified}</StatusBadge>}
                   </div>
                 )}
               </PromptRow>

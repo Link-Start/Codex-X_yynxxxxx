@@ -338,6 +338,18 @@ pub(crate) fn official_config_candidate(
     latest_official_backup(codex_dir)
 }
 
+pub(crate) fn official_auth_available(codex_dir: &Path) -> Result<bool> {
+    match load_snapshot(codex_dir)? {
+        SnapshotState::Ready(_) => return Ok(true),
+        SnapshotState::Reset => return Ok(false),
+        SnapshotState::Missing => {}
+    }
+    if live_config_is_official(codex_dir)? && read_auth_value(&auth_path(codex_dir))?.is_some() {
+        return Ok(true);
+    }
+    Ok(latest_official_backup(codex_dir)?.is_some())
+}
+
 pub(crate) fn get_official_config_draft_inner(
     config_dir: Option<String>,
 ) -> Result<Option<OfficialConfigDraft>> {

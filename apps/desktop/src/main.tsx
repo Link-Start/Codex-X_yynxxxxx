@@ -28,6 +28,7 @@ import type {
   AboutInfo,
   ActionResult,
   AppUpdateInfo,
+  BuiltinPromptDetail,
   BuiltinPromptStatus,
   CodexState,
   ImportResult,
@@ -759,6 +760,7 @@ function App() {
   const [skillsMcpTab, setSkillsMcpTab] = React.useState<"mcp" | "skills">("mcp");
   const [editingProviderId, setEditingProviderId] = React.useState<string | null>(null);
   const [editingPromptId, setEditingPromptId] = React.useState<string | null>(null);
+  const [editingBuiltinPrompt, setEditingBuiltinPrompt] = React.useState<BuiltinPromptDetail | null>(null);
   const [savedProviders, setSavedProviders] = React.useState<SavedProvider[]>([]);
   const [activeProviderId, setActiveProviderId] = React.useState(() => localStorage.getItem(ACTIVE_PROVIDER_KEY) || "");
   const [savedPrompts, setSavedPrompts] = React.useState<SavedPrompt[]>([]);
@@ -1317,15 +1319,33 @@ function App() {
 
   const openAddPrompt = () => {
     setEditingPromptId(null);
+    setEditingBuiltinPrompt(null);
     setPromptForm({ ...blankPromptForm });
     setInstructionMode("form");
   };
 
   const openEditPrompt = (prompt: SavedPrompt) => {
     setEditingPromptId(prompt.id);
+    setEditingBuiltinPrompt(null);
     setPromptForm(prompt);
     setInstructionMode("form");
   };
+
+  const openEditBuiltinPrompt = (templateId: string) =>
+    call(
+      () => invoke<BuiltinPromptDetail>("get_builtin_prompt_detail", { templateId }),
+      (detail) => {
+        setEditingPromptId(null);
+        setEditingBuiltinPrompt(detail);
+        setPromptForm({
+          id: detail.id,
+          title: detail.title,
+          filename: detail.filename,
+          content: detail.content,
+        });
+        setInstructionMode("form");
+      },
+    );
 
   const normalizedPromptForm = (): SavedPrompt => {
     const existing = savedPrompts.filter((item) => item.id !== editingPromptId);
@@ -1340,7 +1360,30 @@ function App() {
     };
   };
 
-  const savePromptOnly = () =>
+  const savePromptOnly = () => {
+    if (editingBuiltinPrompt) {
+      call(
+        async () => {
+          const detail = await invoke<BuiltinPromptDetail>("save_builtin_prompt_override", {
+            templateId: editingBuiltinPrompt.id,
+            content: promptForm.content,
+          });
+          const statuses = await invoke<BuiltinPromptStatus[]>("get_builtin_prompt_status");
+          return { detail, statuses };
+        },
+        ({ detail, statuses }) => {
+          setEditingBuiltinPrompt(detail);
+          setBuiltinPromptStatus(uniqueBuiltinPromptStatuses(statuses));
+          setInstructionMode("list");
+          setToast(detail.customized
+            ? (lang === "zh"
+              ? "本地修改已保存，下次启用时生效；后续 GitHub 同步将跳过这个模板"
+              : "Local changes saved for the next activation. Future GitHub syncs will skip this template.")
+            : (lang === "zh" ? "内容没有变化，模板将继续参与 GitHub 同步" : "No changes detected. This template will continue to sync from GitHub."));
+        },
+      );
+      return;
+    }
     call(
       async () => {
         await invoke<SavedPrompt>("save_prompt", { prompt: normalizedPromptForm() });
@@ -1353,6 +1396,7 @@ function App() {
         setToast(lang === "zh" ? "提示词已保存" : "Prompt saved");
       },
     );
+  };
 
   const enableSavedPrompt = (id: string) =>
     call(() => invoke<ActionResult>("enable_saved_prompt", { configDir: configDir || null, id, injectionMode: promptInjectionMode }), handleActionResult);
@@ -2142,6 +2186,7 @@ function App() {
                 providerLabel={currentProvider?.name || state?.modelProvider}
                 instructionEnabled={Boolean(state?.instructionEnabled)}
                 authExists={Boolean(state?.authExists)}
+                officialAuthAvailable={Boolean(state?.officialAuthAvailable)}
                 configPath={state?.configPath}
                 modelProvider={state?.modelProvider}
                 instructionPath={state
@@ -2359,6 +2404,7 @@ function App() {
                 instructionMode={instructionMode}
                 promptForm={promptForm}
                 editingPromptId={editingPromptId}
+                editingBuiltinPrompt={editingBuiltinPrompt}
                 loading={loading}
                 actionBusy={actionBusy}
                 promptSyncing={promptSyncing}
@@ -2412,6 +2458,7 @@ function App() {
                 onEnableSavedPrompt={enableSavedPrompt}
                 onDisableExternalPrompt={disableExternalInstruction}
                 onEditPrompt={openEditPrompt}
+                onEditBuiltinPrompt={openEditBuiltinPrompt}
                 onDeletePrompt={removeSavedPrompt}
                 onPromptFormFieldChange={(field, value) => setPromptForm((current) => ({
                   ...current,

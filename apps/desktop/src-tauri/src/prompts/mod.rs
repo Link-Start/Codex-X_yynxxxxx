@@ -4,8 +4,8 @@ mod store;
 mod types;
 
 pub(crate) use catalog::{
-    builtin_prompt_content, builtin_prompt_status_inner, bundled_prompt_meta, bundled_prompt_metas,
-    refresh_builtin_prompts_with_active,
+    builtin_prompt_content, builtin_prompt_detail_inner, builtin_prompt_status_inner,
+    bundled_prompt_meta, bundled_prompt_metas, refresh_builtin_prompts_with_active,
 };
 pub(crate) use managed_agents::{
     agents_path, install_managed_agents_block, managed_agents_bounds, managed_agents_template_key,
@@ -13,9 +13,9 @@ pub(crate) use managed_agents::{
 };
 pub(crate) use store::{
     delete_prompt_inner, get_saved_prompt_inner, list_saved_prompts_inner,
-    normalize_prompt_filename, save_prompt_inner,
+    normalize_prompt_filename, save_builtin_prompt_override_inner, save_prompt_inner,
 };
-pub(crate) use types::{BuiltinPromptStatus, SavedPrompt};
+pub(crate) use types::{BuiltinPromptDetail, BuiltinPromptStatus, SavedPrompt};
 
 #[cfg(test)]
 pub(crate) use catalog::{

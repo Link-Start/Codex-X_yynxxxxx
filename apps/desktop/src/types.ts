@@ -53,6 +53,15 @@ export type BuiltinPromptStatus = {
   syncIssue?: "catalog" | "content" | null;
   checkedAt?: string | null;
   message: string;
+  customized: boolean;
+};
+
+export type BuiltinPromptDetail = {
+  id: string;
+  filename: string;
+  title: string;
+  content: string;
+  customized: boolean;
 };
 
 export type BackupEntry = {

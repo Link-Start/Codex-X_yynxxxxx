@@ -35,7 +35,8 @@ pub(crate) use live::{
 #[cfg(test)]
 pub(crate) use official_auth::official_snapshot_path_for_test;
 pub(crate) use official_auth::{
-    capture_live_chatgpt_config, get_official_config_draft_inner, OfficialConfigDraft,
+    capture_live_chatgpt_config, get_official_config_draft_inner, official_auth_available,
+    OfficialConfigDraft,
 };
 #[cfg(test)]
 pub(crate) use store::{

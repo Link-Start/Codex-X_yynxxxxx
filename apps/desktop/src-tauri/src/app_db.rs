@@ -71,6 +71,12 @@ pub(crate) fn open() -> Result<Connection> {
             checked_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS builtin_prompt_overrides (
+            template_id TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS managed_mcp_servers (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,

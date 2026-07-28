@@ -21,6 +21,7 @@ export type OverviewPageProps = {
   providerLabel?: string | null;
   instructionEnabled: boolean;
   authExists: boolean;
+  officialAuthAvailable: boolean;
   configPath?: string | null;
   modelProvider?: string | null;
   instructionPath?: string | null;
@@ -76,6 +77,7 @@ export function OverviewPage({
   providerLabel,
   instructionEnabled,
   authExists,
+  officialAuthAvailable,
   configPath,
   modelProvider,
   instructionPath,
@@ -103,8 +105,9 @@ export function OverviewPage({
         instruction: "指令提示词",
         enabled: "已启用",
         disabled: "未启用",
-        auth: "认证文件",
-        authFile: "auth.json",
+        auth: "认证状态",
+        authFile: "auth.json 已找到",
+        officialAuth: "官方认证已保存",
         noAuth: "未找到",
         updateFound: "发现新版本",
         updateAvailable: (version: string) => `Codex-X ${version} 已发布`,
@@ -134,8 +137,9 @@ export function OverviewPage({
         instruction: "Instructions",
         enabled: "Enabled",
         disabled: "Disabled",
-        auth: "Auth file",
-        authFile: "auth.json",
+        auth: "Authentication",
+        authFile: "auth.json found",
+        officialAuth: "Official auth saved",
         noAuth: "Not found",
         updateFound: "New version available",
         updateAvailable: (version: string) => `Codex-X ${version} is available`,
@@ -159,6 +163,10 @@ export function OverviewPage({
   const displayInstructionPath = instructionPath?.trim() || text.notConfigured;
   const updateVersion = latestVersion?.trim() || "";
   const homeInputValue = configDir || resolvedCodexDir;
+  const authAvailable = authExists || officialAuthAvailable;
+  const authStatus = authExists
+    ? text.authFile
+    : officialAuthAvailable ? text.officialAuth : text.noAuth;
 
   return (
     <section className="cx-overview-page" aria-label={isChinese ? "概览" : "Overview"}>
@@ -227,8 +235,8 @@ export function OverviewPage({
         <StatusCard
           icon={KeyRound}
           label={text.auth}
-          value={authExists ? text.authFile : text.noAuth}
-          tone={authExists ? "success" : "muted"}
+          value={authStatus}
+          tone={authAvailable ? "success" : "muted"}
         />
       </div>
 

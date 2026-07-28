@@ -5,7 +5,7 @@ use crate::file_io::{io_err, json_err, parse_toml_document, read_to_string_if_ex
 use crate::prompts::{
     agents_path, managed_agents_template_key, prompt_template_key_for_instruction,
 };
-use crate::providers::{list_saved_providers_inner, SavedProvider};
+use crate::providers::{list_saved_providers_inner, official_auth_available, SavedProvider};
 use crate::{auth_path, config_path, string_value};
 use serde::Serialize;
 use serde_json::Value;
@@ -205,7 +205,7 @@ pub(crate) fn build_state(codex_dir: PathBuf) -> Result<CodexState> {
         auth_path: auth.display().to_string(),
         config_exists: cfg.exists(),
         auth_exists: auth.exists(),
-        official_auth_available: auth_has_material(&auth)?,
+        official_auth_available: official_auth_available(&codex_dir)?,
         model,
         model_provider,
         instruction_file,

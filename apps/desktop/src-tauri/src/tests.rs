@@ -1504,6 +1504,45 @@ requires_openai_auth = true
 }
 
 #[test]
+fn state_reports_saved_official_auth_without_live_auth_file() {
+    let codex_dir = temp_codex_dir("state-saved-official-auth");
+    write_text(
+        &config_path(&codex_dir),
+        r#"model_provider = "custom"
+model = "proxy-model"
+
+[model_providers.custom]
+name = "Proxy"
+base_url = "https://proxy.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "sk-proxy"
+"#,
+    )
+    .expect("write custom config");
+
+    let result = save_official_config_inner(
+        Some(codex_dir.display().to_string()),
+        Some("official-model".to_string()),
+        Some(
+            json!({
+                "auth_mode": "chatgpt",
+                "tokens": {"access_token": "official-access-token"}
+            })
+            .to_string(),
+        ),
+    )
+    .expect("save independent official config");
+
+    assert!(!auth_path(&codex_dir).exists());
+    let state = serde_json::to_value(result.state).expect("serialize state");
+    assert_eq!(state["authExists"].as_bool(), Some(false));
+    assert_eq!(state["officialAuthAvailable"].as_bool(), Some(true));
+
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
 fn restore_official_config_while_custom_does_not_switch_live_provider() {
     let codex_dir = temp_codex_dir("restore-official-without-switching");
     write_text(

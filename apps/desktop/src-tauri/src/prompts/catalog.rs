@@ -1,6 +1,9 @@
-use super::store::normalize_prompt_filename;
+use super::store::{
+    builtin_prompt_override_ids_inner, builtin_prompt_override_inner, normalize_prompt_filename,
+};
 use super::types::{
-    BuiltinPromptStatus, BundledPromptMeta, CachedBuiltinPrompt, GithubContentEntry,
+    BuiltinPromptDetail, BuiltinPromptStatus, BundledPromptMeta, CachedBuiltinPrompt,
+    GithubContentEntry,
 };
 use crate::constants::{
     GITHUB_EXAMPLES_API, GITHUB_EXAMPLES_BASE, INSTRUCTION_54_CONTENT, INSTRUCTION_54_FILENAME,
@@ -491,6 +494,22 @@ fn fetch_github_prompt_catalog() -> Result<RemotePromptCatalog> {
     fetch_first_valid(&sources, parse_prompt_catalog)
 }
 
+fn confirm_prompt_catalog_with<Fetch>(
+    catalog: RemotePromptCatalog,
+    fetch_authoritative: Fetch,
+) -> (RemotePromptCatalog, bool)
+where
+    Fetch: FnOnce() -> Result<RemotePromptCatalog>,
+{
+    if catalog.authoritative {
+        return (catalog, false);
+    }
+    match fetch_authoritative() {
+        Ok(authoritative) => (authoritative, false),
+        Err(_) => (catalog, true),
+    }
+}
+
 fn prompt_status_from_cache(cache: CachedBuiltinPrompt, message: &str) -> BuiltinPromptStatus {
     let (title, subtitle, badge) = prompt_display_meta(&cache.filename);
     BuiltinPromptStatus {
@@ -506,6 +525,7 @@ fn prompt_status_from_cache(cache: CachedBuiltinPrompt, message: &str) -> Builti
         sync_issue: None,
         checked_at: Some(cache.checked_at),
         message: message.to_string(),
+        customized: false,
     }
 }
 
@@ -562,6 +582,7 @@ fn refresh_builtin_prompt_from_source(
                     "已是最新在线模板"
                 }
                 .to_string(),
+                customized: false,
             })
         }
         Err(_) => {
@@ -593,6 +614,7 @@ fn refresh_builtin_prompt_from_source(
                     "在线模板暂时不可用，且没有本地副本"
                 }
                 .to_string(),
+                customized: false,
             })
         }
     }
@@ -612,7 +634,52 @@ fn bundled_prompt_status(meta: BundledPromptMeta, message: &str) -> BuiltinPromp
         sync_issue: None,
         checked_at: None,
         message: message.to_string(),
+        customized: false,
     }
+}
+
+fn customized_prompt_status(id: &str, filename: &str) -> Result<BuiltinPromptStatus> {
+    let mut status = if let Some(cache) = cached_builtin_prompt(id)? {
+        prompt_status_from_cache(cache, "本地已修改，GitHub 同步已跳过")
+    } else if let Some(meta) = bundled_prompt_meta(id) {
+        bundled_prompt_status(meta, "本地已修改，GitHub 同步已跳过")
+    } else {
+        let (title, subtitle, badge) = prompt_display_meta(filename);
+        BuiltinPromptStatus {
+            id: id.to_string(),
+            filename: filename.to_string(),
+            title,
+            subtitle,
+            badge,
+            source_url: builtin_prompt_source_url(filename),
+            cached: false,
+            updated: false,
+            content_source: "local".to_string(),
+            sync_issue: None,
+            checked_at: None,
+            message: "本地已修改，GitHub 同步已跳过".to_string(),
+            customized: true,
+        }
+    };
+    status.customized = true;
+    status.message = "本地已修改，GitHub 同步已跳过".to_string();
+    Ok(status)
+}
+
+fn mark_customized_prompt_statuses(
+    statuses: &mut [BuiltinPromptStatus],
+    customized_ids: &HashSet<String>,
+) {
+    for status in statuses {
+        if customized_ids.contains(&status.id) {
+            status.customized = true;
+            status.message = "本地已修改，GitHub 同步已跳过".to_string();
+        }
+    }
+}
+
+fn should_sync_prompt_content(id: &str, customized_ids: &HashSet<String>) -> bool {
+    !customized_ids.contains(id)
 }
 
 pub(crate) fn cached_prompt_fallback_statuses(
@@ -657,7 +724,10 @@ pub(crate) fn cached_prompt_fallback_statuses(
 }
 
 pub(crate) fn builtin_prompt_status_inner() -> Result<Vec<BuiltinPromptStatus>> {
-    Ok(cached_prompt_fallback_statuses(cached_builtin_prompts()?))
+    let customized_ids = builtin_prompt_override_ids_inner()?;
+    let mut statuses = cached_prompt_fallback_statuses(cached_builtin_prompts()?);
+    mark_customized_prompt_statuses(&mut statuses, &customized_ids);
+    Ok(statuses)
 }
 
 pub(crate) fn refresh_builtin_prompts_with_active(
@@ -666,38 +736,26 @@ pub(crate) fn refresh_builtin_prompts_with_active(
     let _cache_guard = BUILTIN_PROMPT_CACHE_LOCK
         .lock()
         .map_err(|_| CodexxError::Database("提示词缓存锁已损坏".to_string()))?;
-    let mut catalog = match fetch_prompt_catalog() {
+    let customized_ids = builtin_prompt_override_ids_inner()?;
+    let catalog = match fetch_prompt_catalog() {
         Ok(catalog) => catalog,
         Err(_) => {
             let mut statuses = builtin_prompt_status_inner()?;
             for status in &mut statuses {
                 status.sync_issue = Some("catalog".to_string());
-                status.message = "在线模板目录暂时不可用，已保留本地内容".to_string();
+                if !status.customized {
+                    status.message = "在线模板目录暂时不可用，已保留本地内容".to_string();
+                }
             }
             return Ok(statuses);
         }
     };
     let cached_before = cached_builtin_prompts()?;
-    let mut catalog_confirmation_failed = false;
-    if !catalog.authoritative {
-        let cdn_ids = catalog
-            .prompts
-            .iter()
-            .map(|(id, _)| id.clone())
-            .collect::<HashSet<_>>();
-        let cache_may_be_newer = cached_before
-            .iter()
-            .any(|cache| !cdn_ids.contains(&cache.id));
-        let bundled_missing = bundled_prompt_metas()
-            .into_iter()
-            .any(|meta| !cdn_ids.contains(meta.id));
-        if cache_may_be_newer || bundled_missing {
-            match fetch_github_prompt_catalog() {
-                Ok(authoritative) => catalog = authoritative,
-                Err(_) => catalog_confirmation_failed = true,
-            }
-        }
-    }
+    // A successful CDN response can still contain an old @main directory. Always
+    // confirm directory membership with GitHub so newly added and removed files
+    // become visible immediately; keep the CDN result as the offline fallback.
+    let (catalog, catalog_confirmation_failed) =
+        confirm_prompt_catalog_with(catalog, fetch_github_prompt_catalog);
     let remote_ids = catalog
         .prompts
         .iter()
@@ -710,29 +768,46 @@ pub(crate) fn refresh_builtin_prompts_with_active(
         .collect::<HashSet<_>>();
     let mut statuses = Vec::new();
     for (id, filename) in catalog.prompts {
-        let bundled = bundled_prompt_meta(&id).map(|meta| meta.content);
-        statuses.push(refresh_builtin_prompt_from_source(&id, &filename, bundled)?);
+        if !should_sync_prompt_content(&id, &customized_ids) {
+            statuses.push(customized_prompt_status(&id, &filename)?);
+        } else {
+            let bundled = bundled_prompt_meta(&id).map(|meta| meta.content);
+            statuses.push(refresh_builtin_prompt_from_source(&id, &filename, bundled)?);
+        }
     }
     for meta in bundled_prompt_metas() {
         if !remote_ids.contains(meta.id) {
-            statuses.push(bundled_prompt_status(
-                meta,
-                "在线目录暂未提供该模板，使用软件内置版本",
-            ));
+            statuses.push(if customized_ids.contains(meta.id) {
+                customized_prompt_status(meta.id, meta.filename)?
+            } else {
+                bundled_prompt_status(meta, "在线目录暂未提供该模板，使用软件内置版本")
+            });
         }
     }
 
     if catalog.authoritative {
         let mut retained_ids = remote_ids.clone();
+        for customized_id in &customized_ids {
+            retained_ids.insert(customized_id.clone());
+            if !remote_ids.contains(customized_id)
+                && !statuses.iter().any(|status| status.id == *customized_id)
+            {
+                if let Some(cache) = cached_builtin_prompt(customized_id)? {
+                    statuses.push(customized_prompt_status(customized_id, &cache.filename)?);
+                }
+            }
+        }
         if let Some(active_id) = active_remote_builtin_prompt_id() {
             if !remote_ids.contains(&active_id) {
                 if let Some(cache) = cached_builtin_prompt(&active_id)? {
-                    let mut status = prompt_status_from_cache(
-                        cache,
-                        "该在线模板已下架，当前配置继续使用本地副本",
-                    );
-                    status.content_source = "removed".to_string();
-                    statuses.push(status);
+                    if !statuses.iter().any(|status| status.id == active_id) {
+                        let mut status = prompt_status_from_cache(
+                            cache,
+                            "该在线模板已下架，当前配置继续使用本地副本",
+                        );
+                        status.content_source = "removed".to_string();
+                        statuses.push(status);
+                    }
                 }
                 retained_ids.insert(active_id);
             }
@@ -753,6 +828,7 @@ pub(crate) fn refresh_builtin_prompts_with_active(
     if catalog_confirmation_failed {
         mark_catalog_confirmation_failed(&mut statuses);
     }
+    mark_customized_prompt_statuses(&mut statuses, &customized_ids);
     let order = bundled_prompt_metas()
         .into_iter()
         .enumerate()
@@ -788,6 +864,14 @@ pub(crate) fn builtin_prompt_content(
         .map(|item| item.filename.clone())
         .or_else(|| bundled.map(|item| item.filename.to_string()))
         .ok_or_else(|| CodexxError::Config(format!("提示词模板不存在或尚未同步: {id}")))?;
+    if let Some(content) = builtin_prompt_override_inner(id)? {
+        return Ok((
+            filename.clone(),
+            format!("./{filename}"),
+            content,
+            "本地已修改".to_string(),
+        ));
+    }
     let trust = PromptContentTrust {
         cached: cached.as_ref().map(|item| item.content.as_str()),
         bundled: bundled.map(|item| item.content),
@@ -818,6 +902,23 @@ pub(crate) fn builtin_prompt_content(
         bundled.content.to_string(),
         "打包内置".to_string(),
     ))
+}
+
+pub(crate) fn builtin_prompt_detail_inner(template_id: &str) -> Result<BuiltinPromptDetail> {
+    let id = if template_id.trim().is_empty() {
+        "gpt5.5-unrestricted"
+    } else {
+        template_id.trim()
+    };
+    let (filename, _, content, _) = builtin_prompt_content(id)?;
+    let (title, _, _) = prompt_display_meta(&filename);
+    Ok(BuiltinPromptDetail {
+        id: id.to_string(),
+        filename,
+        title,
+        content,
+        customized: builtin_prompt_override_inner(id)?.is_some(),
+    })
 }
 
 #[cfg(test)]
@@ -911,6 +1012,86 @@ mod tests {
             .starts_with("github-software-development-debugging-"));
         assert!(stable_remote_prompt_id("writing-clarity-editor.md")
             .starts_with("github-writing-clarity-editor-"));
+    }
+
+    #[test]
+    fn locally_modified_prompt_is_excluded_from_content_sync() {
+        let customized_ids = HashSet::from(["edited-template".to_string()]);
+
+        assert!(!should_sync_prompt_content(
+            "edited-template",
+            &customized_ids
+        ));
+        assert!(should_sync_prompt_content(
+            "new-github-template",
+            &customized_ids
+        ));
+    }
+
+    #[test]
+    fn locally_modified_prompt_status_is_visible_after_restart() {
+        let cache = CachedBuiltinPrompt {
+            id: "edited-template".to_string(),
+            filename: "edited-template.md".to_string(),
+            source_url: "https://example.test/edited-template.md".to_string(),
+            content: "upstream cache".to_string(),
+            checked_at: "2026-07-28T00:00:00Z".to_string(),
+        };
+        let mut statuses = cached_prompt_fallback_statuses(vec![cache]);
+        let customized_ids = HashSet::from(["edited-template".to_string()]);
+
+        mark_customized_prompt_statuses(&mut statuses, &customized_ids);
+
+        let status = statuses
+            .iter()
+            .find(|status| status.id == "edited-template")
+            .expect("customized cached prompt remains visible");
+        assert!(status.customized);
+        assert!(status.message.contains("同步已跳过"));
+    }
+
+    #[test]
+    fn stale_cdn_catalog_is_always_replaced_by_github_catalog() {
+        let cdn = RemotePromptCatalog {
+            prompts: vec![("bundled".to_string(), "bundled.md".to_string())],
+            authoritative: false,
+        };
+        let github = RemotePromptCatalog {
+            prompts: vec![
+                ("bundled".to_string(), "bundled.md".to_string()),
+                (
+                    "github-software-development-debugging-test".to_string(),
+                    "software-development-debugging.md".to_string(),
+                ),
+            ],
+            authoritative: true,
+        };
+        let mut calls = 0;
+
+        let (confirmed, failed) = confirm_prompt_catalog_with(cdn, || {
+            calls += 1;
+            Ok(github)
+        });
+
+        assert_eq!(calls, 1);
+        assert!(!failed);
+        assert!(confirmed.authoritative);
+        assert_eq!(confirmed.prompts.len(), 2);
+    }
+
+    #[test]
+    fn unavailable_github_catalog_keeps_cdn_fallback_for_retry() {
+        let cdn = RemotePromptCatalog {
+            prompts: vec![("bundled".to_string(), "bundled.md".to_string())],
+            authoritative: false,
+        };
+
+        let (fallback, failed) =
+            confirm_prompt_catalog_with(cdn, || Err(CodexxError::Config("offline".to_string())));
+
+        assert!(failed);
+        assert!(!fallback.authoritative);
+        assert_eq!(fallback.prompts.len(), 1);
     }
 
     #[test]

@@ -48,12 +48,13 @@ use file_io::{
 use paths::app_home;
 use paths::home_dir;
 use prompts::{
-    agents_path, builtin_prompt_content, builtin_prompt_status_inner, bundled_prompt_meta,
-    delete_prompt_inner, get_saved_prompt_inner, install_managed_agents_block,
+    agents_path, builtin_prompt_content, builtin_prompt_detail_inner, builtin_prompt_status_inner,
+    bundled_prompt_meta, delete_prompt_inner, get_saved_prompt_inner, install_managed_agents_block,
     list_saved_prompts_inner, managed_agents_bounds, normalize_prompt_filename,
     prompt_template_key_for_instruction, refresh_builtin_prompts_with_active,
-    remember_current_instruction_prompt, resolve_instruction_path, save_prompt_inner,
-    uninstall_managed_agents_block, BuiltinPromptStatus, SavedPrompt,
+    remember_current_instruction_prompt, resolve_instruction_path,
+    save_builtin_prompt_override_inner, save_prompt_inner, uninstall_managed_agents_block,
+    BuiltinPromptDetail, BuiltinPromptStatus, SavedPrompt,
 };
 #[cfg(test)]
 use prompts::{
@@ -656,6 +657,33 @@ async fn get_builtin_prompt_status() -> Result<Vec<BuiltinPromptStatus>> {
 }
 
 #[tauri::command]
+async fn get_builtin_prompt_detail(template_id: String) -> Result<BuiltinPromptDetail> {
+    tauri::async_runtime::spawn_blocking(move || builtin_prompt_detail_inner(&template_id))
+        .await
+        .map_err(|e| CodexxError::Config(format!("读取内置提示词失败: {e}")))?
+}
+
+#[tauri::command]
+async fn save_builtin_prompt_override(
+    template_id: String,
+    content: String,
+) -> Result<BuiltinPromptDetail> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let id = template_id.trim();
+        // Resolve first so stale or unknown IDs cannot create detached local records.
+        let current = builtin_prompt_detail_inner(id)?;
+        let content = content.trim();
+        if !current.customized && current.content.trim() == content {
+            return Ok(current);
+        }
+        save_builtin_prompt_override_inner(id, content)?;
+        builtin_prompt_detail_inner(id)
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("保存内置提示词修改失败: {e}")))?
+}
+
+#[tauri::command]
 async fn refresh_builtin_prompts(config_dir: Option<String>) -> Result<Vec<BuiltinPromptStatus>> {
     tauri::async_runtime::spawn_blocking(move || refresh_builtin_prompts_inner(config_dir))
         .await
@@ -1216,6 +1244,8 @@ pub fn run() {
             import_ccswitch_codex_providers,
             list_saved_prompts,
             get_builtin_prompt_status,
+            get_builtin_prompt_detail,
+            save_builtin_prompt_override,
             refresh_builtin_prompts,
             remember_current_instruction,
             save_prompt,

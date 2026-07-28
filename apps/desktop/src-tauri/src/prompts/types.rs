@@ -24,6 +24,17 @@ pub(crate) struct BuiltinPromptStatus {
     pub(crate) sync_issue: Option<String>,
     pub(crate) checked_at: Option<String>,
     pub(crate) message: String,
+    pub(crate) customized: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BuiltinPromptDetail {
+    pub(crate) id: String,
+    pub(crate) filename: String,
+    pub(crate) title: String,
+    pub(crate) content: String,
+    pub(crate) customized: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
