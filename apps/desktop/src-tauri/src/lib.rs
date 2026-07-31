@@ -18,8 +18,10 @@ mod backups;
 mod ccswitch;
 mod config_migration;
 mod constants;
+mod desktop_lifecycle;
 mod error;
 mod file_io;
+mod live_config;
 mod paths;
 mod platform;
 mod prompts;
@@ -35,53 +37,62 @@ mod state;
 mod toml_utils;
 mod updates;
 
-use backups::{action_backup_root, backups, create_backup, BackupEntry, BackupMeta};
+use backups::{
+    action_backup_root, backups, create_backup, validate_backup_codex_dir, BackupEntry, BackupMeta,
+};
+use config_migration::{migrate_legacy_prompt_config_locked, migrated_legacy_prompt_config_text};
 use constants::*;
 use error::{CodexxError, Result};
+#[cfg(target_os = "windows")]
+use file_io::io_err;
+use file_io::{directory_exists, ensure_directory, parse_toml_document};
 #[cfg(test)]
-use file_io::write_json;
-use file_io::{
-    atomic_write, directory_exists, ensure_directory, io_err, parse_toml_document,
-    read_to_string_if_exists, write_text,
+use file_io::{write_json, write_text};
+use live_config::{
+    acquire_live_config_lock, apply_file_change, fail_with_file_rollback, read_file_snapshot,
+    text_from_snapshot, AppliedFileChange,
 };
 #[cfg(test)]
 use paths::app_home;
 use paths::home_dir;
 use prompts::{
     agents_path, builtin_prompt_content, builtin_prompt_detail_inner, builtin_prompt_status_inner,
-    bundled_prompt_meta, delete_prompt_inner, get_saved_prompt_inner, install_managed_agents_block,
-    list_saved_prompts_inner, managed_agents_bounds, normalize_prompt_filename,
-    prompt_template_key_for_instruction, refresh_builtin_prompts_with_active,
-    remember_current_instruction_prompt, resolve_instruction_path,
-    save_builtin_prompt_override_inner, save_prompt_inner, uninstall_managed_agents_block,
-    BuiltinPromptDetail, BuiltinPromptStatus, SavedPrompt,
+    bundled_prompt_meta, delete_prompt_inner, get_saved_prompt_inner,
+    install_managed_agents_block_in_content, list_saved_prompts_inner, managed_agents_bounds,
+    normalize_prompt_filename, prompt_template_key_for_instruction,
+    refresh_builtin_prompts_with_active, remember_current_instruction_prompt,
+    remove_managed_agents_block_from_content, resolve_instruction_path,
+    save_builtin_prompt_override_inner, save_prompt_inner, BuiltinPromptDetail,
+    BuiltinPromptStatus, SavedPrompt,
 };
 #[cfg(test)]
 use prompts::{
     bundled_prompt_metas, cached_prompt_fallback_statuses, delete_cached_prompt_ids,
-    github_prompt_catalog_from_entries, jsdelivr_prompt_catalog_from_entries,
-    managed_agents_template_key_from_content, prompt_content_source_urls, stable_remote_prompt_id,
-    stale_cached_prompt_ids, CachedBuiltinPrompt, GithubContentEntry,
+    github_prompt_catalog_from_entries, install_managed_agents_block,
+    jsdelivr_prompt_catalog_from_entries, managed_agents_template_key_from_content,
+    prompt_content_source_urls, stable_remote_prompt_id, stale_cached_prompt_ids,
+    uninstall_managed_agents_block, CachedBuiltinPrompt, GithubContentEntry,
 };
 #[cfg(test)]
 use providers::{
     build_ccswitch_codex_provider, canonical_provider_base_url, codex_sections_from_config,
-    detected_live_custom_provider, is_official_ccswitch_row, list_saved_providers_on_connection,
-    merge_duplicate_provider_identities, normalize_saved_provider, provider_by_id_on_connection,
-    provider_identity, provider_status_result, read_ccswitch_codex_rows,
-    save_manual_provider_on_connection, save_provider_toml_config_with_pre_persist,
-    switch_official_provider_with_pre_persist, switch_provider_with_pre_persist,
+    consolidate_legacy_provider_duplicates_on_connection, detected_live_custom_provider,
+    is_official_ccswitch_row, list_saved_providers_on_connection, normalize_saved_provider,
+    official_snapshot_path_for_test, provider_by_id_on_connection, provider_identity,
+    provider_status_result, read_ccswitch_codex_rows, save_manual_provider_on_connection,
+    save_provider_toml_config_with_pre_persist, switch_official_provider_with_pre_persist,
+    switch_provider_with_pre_persist, upsert_ccswitch_provider_on_connection,
     upsert_provider_on_connection, CcSwitchCodexRow, ProviderUpsertKind, ProviderUpsertMode,
 };
 use providers::{
-    capture_live_chatgpt_config, delete_provider_inner, fetch_provider_models_inner,
+    capture_live_chatgpt_config, delete_saved_provider_inner, fetch_provider_models_inner,
     get_official_config_draft_inner, import_ccswitch_codex_providers_inner,
     list_saved_providers_inner, read_ccswitch_official_auth_inner, reset_official_provider_inner,
-    restore_official_provider_inner, save_official_config_inner, save_provider_inner,
-    save_provider_toml_config_inner, switch_official_provider_inner, switch_provider_inner,
-    test_provider_connection_inner, ImportResult, OfficialAuthCandidate, OfficialConfigDraft,
-    OfficialConfigInput, ProviderConnectionResult, ProviderInput, ProviderModelsResult,
-    ProviderTomlInput, SavedProvider,
+    restore_official_provider_inner, save_active_provider_inner, save_official_config_inner,
+    save_provider_inner, save_provider_toml_config_inner, switch_official_provider_inner,
+    switch_provider_inner, test_provider_connection_inner, ImportResult, OfficialAuthCandidate,
+    OfficialConfigDraft, OfficialConfigInput, ProviderConnectionResult, ProviderInput,
+    ProviderModelsResult, ProviderTomlInput, SavedProvider,
 };
 #[cfg(test)]
 use sessions::{
@@ -113,7 +124,9 @@ use skins::{
 };
 #[cfg(test)]
 use state::active_saved_provider_id_from_config;
-use state::{auth_has_material, build_state, ActionResult, CodexState};
+use state::{
+    auth_has_material, build_state, build_state_after_migration, ActionResult, CodexState,
+};
 use toml_edit::{value, DocumentMut};
 pub(crate) use toml_utils::string_value;
 use updates::check_app_update;
@@ -747,6 +760,23 @@ fn managed_model_instruction_path(codex_dir: &Path, doc: &DocumentMut) -> Result
     Ok(Some(resolve_instruction_path(codex_dir, &current)))
 }
 
+fn finish_file_action(
+    codex_dir: PathBuf,
+    changes: &[AppliedFileChange],
+    message: String,
+    backup_id: Option<String>,
+) -> Result<ActionResult> {
+    match build_state_after_migration(codex_dir) {
+        Ok(state) => Ok(ActionResult {
+            ok: true,
+            message,
+            backup_id,
+            state,
+        }),
+        Err(error) => fail_with_file_rollback(error, changes),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn enable_prompt_content_inner(
     config_dir: Option<String>,
@@ -771,49 +801,84 @@ fn enable_prompt_content_inner(
 
     let codex_dir = resolve_codex_dir(config_dir)?;
     ensure_directory(&codex_dir)?;
+    let _live_lock = acquire_live_config_lock(&codex_dir)?;
+    migrate_legacy_prompt_config_locked(&codex_dir)?;
     let cfg = config_path(&codex_dir);
     let agents = agents_path(&codex_dir);
-    let text = read_to_string_if_exists(&cfg)?;
+    let config_before = read_file_snapshot(&cfg)?;
+    let text = text_from_snapshot(&cfg, config_before.as_deref())?;
     let mut doc = parse_toml_document(&cfg, &text)?;
-    let agents_text = read_to_string_if_exists(&agents)?;
+    let agents_before = read_file_snapshot(&agents)?;
+    let agents_text = text_from_snapshot(&agents, agents_before.as_deref())?;
     managed_agents_bounds(&agents_text)?;
     let previous_managed_file = managed_model_instruction_path(&codex_dir, &doc)?;
     if injection_mode == PromptInjectionMode::Replace {
-        let _ = remember_current_instruction_prompt(&codex_dir);
+        remember_current_instruction_prompt(&codex_dir)?;
     }
     let backup_id = create_backup(&codex_dir, action)?;
+    let mut changes = Vec::new();
 
-    match injection_mode {
-        PromptInjectionMode::Replace => {
-            if doc.get("model").is_none() {
-                doc["model"] = value("gpt-5.5");
+    let mutation = (|| -> Result<()> {
+        match injection_mode {
+            PromptInjectionMode::Replace => {
+                if doc.get("model").is_none() {
+                    doc["model"] = value("gpt-5.5");
+                }
+                doc["model_instructions_file"] = value(format!("./{filename}"));
+                let prompt_path = codex_dir.join(filename);
+                let prompt_before = read_file_snapshot(&prompt_path)?;
+                changes.push(apply_file_change(
+                    &prompt_path,
+                    prompt_before,
+                    Some(content.as_bytes().to_vec()),
+                )?);
+                changes.push(apply_file_change(
+                    &cfg,
+                    config_before,
+                    Some(doc.to_string().into_bytes()),
+                )?);
+                let (next_agents, _) = remove_managed_agents_block_from_content(&agents_text)?;
+                let next_agents =
+                    (!next_agents.trim().is_empty()).then(|| next_agents.into_bytes());
+                changes.push(apply_file_change(&agents, agents_before, next_agents)?);
             }
-            doc["model_instructions_file"] = value(format!("./{filename}"));
-            write_text(&codex_dir.join(filename), content)?;
-            write_text(&cfg, &doc.to_string())?;
-            uninstall_managed_agents_block(&codex_dir)?;
-        }
-        PromptInjectionMode::Append => {
-            install_managed_agents_block(&codex_dir, template_key, content)?;
-            if previous_managed_file.is_some() {
-                doc.as_table_mut().remove("model_instructions_file");
-                write_text(&cfg, &doc.to_string())?;
+            PromptInjectionMode::Append => {
+                let next_agents =
+                    install_managed_agents_block_in_content(&agents_text, template_key, content)?;
+                changes.push(apply_file_change(
+                    &agents,
+                    agents_before,
+                    Some(next_agents.into_bytes()),
+                )?);
+                if previous_managed_file.is_some() {
+                    doc.as_table_mut().remove("model_instructions_file");
+                    changes.push(apply_file_change(
+                        &cfg,
+                        config_before,
+                        Some(doc.to_string().into_bytes()),
+                    )?);
+                }
             }
         }
+
+        if let Some(previous) = previous_managed_file {
+            let next = codex_dir.join(filename);
+            let should_remove = injection_mode == PromptInjectionMode::Append || previous != next;
+            if should_remove && previous.parent() == Some(codex_dir.as_path()) {
+                let previous_before = read_file_snapshot(&previous)?;
+                changes.push(apply_file_change(&previous, previous_before, None)?);
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = mutation {
+        return fail_with_file_rollback(error, &changes);
     }
 
-    if let Some(previous) = previous_managed_file {
-        let next = codex_dir.join(filename);
-        let should_remove = injection_mode == PromptInjectionMode::Append || previous != next;
-        if should_remove && previous.parent() == Some(codex_dir.as_path()) && previous.exists() {
-            fs::remove_file(&previous).map_err(|e| io_err(&previous, e))?;
-        }
-    }
-
-    let state = build_state(codex_dir)?;
-    Ok(ActionResult {
-        ok: true,
-        message: format!(
+    finish_file_action(
+        codex_dir,
+        &changes,
+        format!(
             "已用{}模式启用 {title}（来源：{content_source}）",
             if injection_mode == PromptInjectionMode::Append {
                 "追加"
@@ -822,8 +887,7 @@ fn enable_prompt_content_inner(
             }
         ),
         backup_id,
-        state,
-    })
+    )
 }
 
 fn enable_saved_prompt_inner(
@@ -877,23 +941,38 @@ async fn save_provider(provider: SavedProvider) -> Result<SavedProvider> {
 }
 
 #[tauri::command]
-async fn delete_saved_provider(id: String) -> Result<()> {
-    tauri::async_runtime::spawn_blocking(move || delete_provider_inner(id.trim()))
+async fn save_active_provider(
+    provider: SavedProvider,
+    config_dir: Option<String>,
+) -> Result<ActionResult> {
+    tauri::async_runtime::spawn_blocking(move || save_active_provider_inner(provider, config_dir))
+        .await
+        .map_err(|e| CodexxError::Config(format!("保存活动供应商失败: {e}")))?
+}
+
+#[tauri::command]
+async fn delete_saved_provider(id: String, config_dir: Option<String>) -> Result<()> {
+    tauri::async_runtime::spawn_blocking(move || delete_saved_provider_inner(id.trim(), config_dir))
         .await
         .map_err(|e| CodexxError::Config(format!("删除供应商失败: {e}")))?
 }
 
 #[tauri::command]
 async fn get_codex_state(config_dir: Option<String>) -> Result<CodexState> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let codex_dir = resolve_codex_dir(config_dir)?;
-        // Read-only refreshes only capture high-confidence ChatGPT credentials.
-        // Explicit provider switches also preserve official API-key configs.
-        let _ = capture_live_chatgpt_config(&codex_dir);
-        build_state(codex_dir)
-    })
-    .await
-    .map_err(|e| CodexxError::Config(format!("读取 Codex 状态失败: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || get_codex_state_inner(config_dir))
+        .await
+        .map_err(|e| CodexxError::Config(format!("读取 Codex 状态失败: {e}")))?
+}
+
+fn get_codex_state_inner(config_dir: Option<String>) -> Result<CodexState> {
+    let codex_dir = resolve_codex_dir(config_dir)?;
+    ensure_directory(&codex_dir)?;
+    let _live_lock = acquire_live_config_lock(&codex_dir)?;
+    migrate_legacy_prompt_config_locked(&codex_dir)?;
+    // Read-only refreshes only capture high-confidence ChatGPT credentials.
+    // Explicit provider switches also preserve official API-key configs.
+    capture_live_chatgpt_config(&codex_dir)?;
+    build_state_after_migration(codex_dir)
 }
 
 #[tauri::command]
@@ -991,34 +1070,59 @@ fn disable_instruction_inner(
     delete_file: Option<bool>,
 ) -> Result<ActionResult> {
     let codex_dir = resolve_codex_dir(config_dir)?;
+    ensure_directory(&codex_dir)?;
+    let _live_lock = acquire_live_config_lock(&codex_dir)?;
+    migrate_legacy_prompt_config_locked(&codex_dir)?;
     let cfg = config_path(&codex_dir);
-    let agents_text = read_to_string_if_exists(&agents_path(&codex_dir))?;
+    let agents = agents_path(&codex_dir);
+    let agents_before = read_file_snapshot(&agents)?;
+    let agents_text = text_from_snapshot(&agents, agents_before.as_deref())?;
     managed_agents_bounds(&agents_text)?;
     let backup_id = create_backup(&codex_dir, "disable-instruct")?;
 
-    let text = read_to_string_if_exists(&cfg)?;
+    let config_before = read_file_snapshot(&cfg)?;
+    let text = text_from_snapshot(&cfg, config_before.as_deref())?;
     let mut doc = parse_toml_document(&cfg, &text)?;
     let current = string_value(&doc, "model_instructions_file");
     let managed_model_path = managed_model_instruction_path(&codex_dir, &doc)?;
     let removed_model = managed_model_path.is_some();
+    let mut changes = Vec::new();
     if removed_model {
         doc.as_table_mut().remove("model_instructions_file");
-        write_text(&cfg, &doc.to_string())?;
+        changes.push(apply_file_change(
+            &cfg,
+            config_before,
+            Some(doc.to_string().into_bytes()),
+        )?);
     }
-    let removed_agents = uninstall_managed_agents_block(&codex_dir)?;
+    let (next_agents, removed_agents) = remove_managed_agents_block_from_content(&agents_text)?;
+    if removed_agents {
+        let next_agents = (!next_agents.trim().is_empty()).then(|| next_agents.into_bytes());
+        match apply_file_change(&agents, agents_before, next_agents) {
+            Ok(change) => changes.push(change),
+            Err(error) => return fail_with_file_rollback(error, &changes),
+        }
+    }
     if delete_file.unwrap_or(true) {
         if let Some(md) = managed_model_path {
-            if md.parent() == Some(codex_dir.as_path()) && md.exists() {
-                fs::remove_file(&md).map_err(|e| io_err(&md, e))?;
+            if md.parent() == Some(codex_dir.as_path()) {
+                let before = match read_file_snapshot(&md) {
+                    Ok(before) => before,
+                    Err(error) => return fail_with_file_rollback(error, &changes),
+                };
+                match apply_file_change(&md, before, None) {
+                    Ok(change) => changes.push(change),
+                    Err(error) => return fail_with_file_rollback(error, &changes),
+                }
             }
         }
     }
 
-    let state = build_state(codex_dir)?;
     let removed = removed_model || removed_agents;
-    Ok(ActionResult {
-        ok: true,
-        message: if removed {
+    finish_file_action(
+        codex_dir,
+        &changes,
+        if removed {
             "已禁用指令提示词".to_string()
         } else if current.is_some() {
             "当前使用的是用户自己的提示词，Codex-X 未做修改".to_string()
@@ -1026,8 +1130,7 @@ fn disable_instruction_inner(
             "当前没有启用 Codex-X 提示词".to_string()
         },
         backup_id,
-        state,
-    })
+    )
 }
 
 #[tauri::command]
@@ -1042,8 +1145,12 @@ async fn disable_instruction(
 
 fn disable_external_instruction_inner(config_dir: Option<String>) -> Result<ActionResult> {
     let codex_dir = resolve_codex_dir(config_dir)?;
+    ensure_directory(&codex_dir)?;
+    let _live_lock = acquire_live_config_lock(&codex_dir)?;
+    migrate_legacy_prompt_config_locked(&codex_dir)?;
     let cfg = config_path(&codex_dir);
-    let text = read_to_string_if_exists(&cfg)?;
+    let config_before = read_file_snapshot(&cfg)?;
+    let text = text_from_snapshot(&cfg, config_before.as_deref())?;
     let mut doc = parse_toml_document(&cfg, &text)?;
     let current = string_value(&doc, "model_instructions_file");
     if let Some(value) = current.as_deref() {
@@ -1054,21 +1161,25 @@ fn disable_external_instruction_inner(config_dir: Option<String>) -> Result<Acti
         }
     }
     let backup_id = create_backup(&codex_dir, "disable-external-instruct")?;
+    let mut changes = Vec::new();
     if current.is_some() {
         doc.as_table_mut().remove("model_instructions_file");
-        write_text(&cfg, &doc.to_string())?;
+        changes.push(apply_file_change(
+            &cfg,
+            config_before,
+            Some(doc.to_string().into_bytes()),
+        )?);
     }
-    let state = build_state(codex_dir)?;
-    Ok(ActionResult {
-        ok: true,
-        message: if current.is_some() {
+    finish_file_action(
+        codex_dir,
+        &changes,
+        if current.is_some() {
             "已禁用用户外部提示词，原 md 文件已保留".to_string()
         } else {
             "当前没有外部提示词".to_string()
         },
         backup_id,
-        state,
-    })
+    )
 }
 
 #[tauri::command]
@@ -1119,56 +1230,119 @@ async fn list_backups() -> Result<Vec<BackupEntry>> {
         .map_err(|e| CodexxError::Config(format!("读取备份列表失败: {e}")))?
 }
 
+fn read_backup_file_snapshot(path: &Path) -> Result<Option<Vec<u8>>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(file_io::io_err(path, error)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(CodexxError::Config(format!(
+            "备份文件不是普通文件: {}",
+            path.display()
+        )));
+    }
+    read_file_snapshot(path)
+}
+
+fn declared_backup_file_snapshot(path: &Path, declared_present: bool) -> Result<Option<Vec<u8>>> {
+    match (declared_present, read_backup_file_snapshot(path)?) {
+        (true, Some(bytes)) => Ok(Some(bytes)),
+        (true, None) => Err(CodexxError::Config(format!(
+            "备份元数据声明文件存在，但备份文件缺失: {}",
+            path.display()
+        ))),
+        (false, None) => Ok(None),
+        (false, Some(_)) => Err(CodexxError::Config(format!(
+            "备份元数据声明文件不存在，但目录中出现了多余文件: {}",
+            path.display()
+        ))),
+    }
+}
+
 fn restore_backup_inner(config_dir: Option<String>, backup_id: String) -> Result<ActionResult> {
     let codex_dir = resolve_codex_dir(config_dir)?;
+    let backup_id = backup_id.trim().to_string();
+    let mut backup_components = Path::new(&backup_id).components();
+    if !matches!(
+        backup_components.next(),
+        Some(std::path::Component::Normal(_))
+    ) || backup_components.next().is_some()
+    {
+        return Err(CodexxError::Config("备份 ID 无效".to_string()));
+    }
     let dir = action_backup_root(&codex_dir)?.join(&backup_id);
-    if !dir.exists() {
+    let dir_metadata = fs::symlink_metadata(&dir).ok();
+    if !dir_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+    {
         return Err(CodexxError::Config(format!("备份不存在: {backup_id}")));
     }
 
-    let restore_marker = create_backup(&codex_dir, "before-restore")?;
+    let backup_meta_path = dir.join("meta.json");
+    let backup_meta_bytes = read_backup_file_snapshot(&backup_meta_path)?.ok_or_else(|| {
+        CodexxError::Config(format!(
+            "备份缺少元数据文件: {}",
+            backup_meta_path.display()
+        ))
+    })?;
+    let backup_meta = serde_json::from_slice::<BackupMeta>(&backup_meta_bytes)
+        .map_err(|error| file_io::json_err(&backup_meta_path, error))?;
+    if backup_meta.id != backup_id {
+        return Err(CodexxError::Config(format!(
+            "备份元数据 ID 与请求不一致：元数据为 {}，请求为 {backup_id}",
+            backup_meta.id
+        )));
+    }
+    validate_backup_codex_dir(&backup_meta, &codex_dir)?;
+
     let cfg = config_path(&codex_dir);
     let auth = auth_path(&codex_dir);
     let agents = agents_path(&codex_dir);
-    ensure_directory(&codex_dir)?;
-
-    let backup_meta = fs::read_to_string(dir.join("meta.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<BackupMeta>(&text).ok());
-
     let backup_cfg = dir.join("config.toml");
-    if backup_cfg.exists() {
-        let bytes = fs::read(&backup_cfg).map_err(|e| io_err(&backup_cfg, e))?;
-        atomic_write(&cfg, &bytes)?;
-    } else if cfg.exists() {
-        fs::remove_file(&cfg).map_err(|e| io_err(&cfg, e))?;
-    }
-
     let backup_auth = dir.join("auth.json");
-    if backup_auth.exists() {
-        let bytes = fs::read(&backup_auth).map_err(|e| io_err(&backup_auth, e))?;
-        atomic_write(&auth, &bytes)?;
-    } else if auth.exists() {
-        fs::remove_file(&auth).map_err(|e| io_err(&auth, e))?;
-    }
-
-    if backup_meta.as_ref().is_some_and(|meta| meta.tracks_agents) {
-        let backup_agents = dir.join(AGENTS_FILENAME);
-        if backup_agents.exists() {
-            let bytes = fs::read(&backup_agents).map_err(|e| io_err(&backup_agents, e))?;
-            atomic_write(&agents, &bytes)?;
-        } else if agents.exists() {
-            fs::remove_file(&agents).map_err(|e| io_err(&agents, e))?;
+    let backup_agents = dir.join(AGENTS_FILENAME);
+    let backup_config = declared_backup_file_snapshot(&backup_cfg, backup_meta.had_config)?;
+    let backup_config = match backup_config {
+        Some(bytes) => {
+            let text = text_from_snapshot(&backup_cfg, Some(&bytes))?;
+            Some(
+                migrated_legacy_prompt_config_text(&cfg, &text)?
+                    .unwrap_or(text)
+                    .into_bytes(),
+            )
         }
+        None => None,
+    };
+    let backup_auth = declared_backup_file_snapshot(&backup_auth, backup_meta.had_auth)?;
+    let backup_agents = declared_backup_file_snapshot(&backup_agents, backup_meta.had_agents)?;
+
+    ensure_directory(&codex_dir)?;
+    let _live_lock = acquire_live_config_lock(&codex_dir)?;
+    migrate_legacy_prompt_config_locked(&codex_dir)?;
+    let restore_marker = create_backup(&codex_dir, "before-restore")?;
+    let config_before = read_file_snapshot(&cfg)?;
+    let auth_before = read_file_snapshot(&auth)?;
+    let agents_before = read_file_snapshot(&agents)?;
+
+    let mut changes = Vec::new();
+    let mutation = (|| -> Result<()> {
+        changes.push(apply_file_change(&cfg, config_before, backup_config)?);
+        changes.push(apply_file_change(&auth, auth_before, backup_auth)?);
+        changes.push(apply_file_change(&agents, agents_before, backup_agents)?);
+        Ok(())
+    })();
+    if let Err(error) = mutation {
+        return fail_with_file_rollback(error, &changes);
     }
 
-    let state = build_state(codex_dir)?;
-    Ok(ActionResult {
-        ok: true,
-        message: format!("已恢复备份 {backup_id}"),
-        backup_id: restore_marker,
-        state,
-    })
+    finish_file_action(
+        codex_dir,
+        &changes,
+        format!("已恢复备份 {backup_id}"),
+        restore_marker,
+    )
 }
 
 #[tauri::command]
@@ -1214,10 +1388,20 @@ fn open_url(url: String) -> std::result::Result<(), String> {
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
+        // This must remain the first plugin so a second launch cannot initialize
+        // another tray or start concurrent configuration work.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            desktop_lifecycle::restore_main_window(app);
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .setup(|app| {
+            desktop_lifecycle::setup_system_tray(app)?;
+            Ok(())
+        })
+        .on_window_event(desktop_lifecycle::handle_window_event)
         .invoke_handler(tauri::generate_handler![
             get_about_info,
             check_app_update,
@@ -1253,6 +1437,7 @@ pub fn run() {
             enable_saved_prompt,
             list_saved_providers,
             save_provider,
+            save_active_provider,
             delete_saved_provider,
             get_codex_state,
             switch_official_provider,
@@ -1272,8 +1457,10 @@ pub fn run() {
             restore_backup,
             open_url,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Codex-X");
+        .build(tauri::generate_context!())
+        .expect("error while building Codex-X");
+
+    app.run(desktop_lifecycle::handle_run_event);
 }
 
 #[cfg(test)]

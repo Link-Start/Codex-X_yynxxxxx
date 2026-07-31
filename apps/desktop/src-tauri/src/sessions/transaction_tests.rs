@@ -18,6 +18,8 @@ fn temp_dir(name: &str) -> PathBuf {
     ));
     let _ = fs::remove_dir_all(&path);
     fs::create_dir_all(&path).expect("create test directory");
+    fs::write(path.join("config.toml"), "model_provider = \"custom\"\n")
+        .expect("write shared provider config");
     path
 }
 
@@ -332,53 +334,7 @@ fn sqlite_prepare_deduplicates_symlink_aliases() {
 }
 
 #[test]
-fn global_main_failpoint_restores_prior_mutations_without_touching_backup() {
-    let codex_dir = temp_dir("global-main-failpoint");
-    let id = "019f6000-0000-7000-8000-000000000408";
-    let rollout = codex_dir.join(format!("sessions/rollout-test-{id}.jsonl"));
-    let original_rollout = write_rollout(&rollout, id);
-    let database = codex_dir.join("state_10.sqlite");
-    create_thread_database(&database, id, &rollout);
-    let global = codex_dir.join(".codex-global-state.json");
-    let global_backup = codex_dir.join(".codex-global-state.json.bak");
-    let original_global = br#"{"electron-saved-workspace-roots":"/tmp/project"}"#;
-    fs::write(&global, original_global).expect("write original global state");
-    assert!(!global_backup.exists());
-
-    let error = sync_sessions_provider_with_hook(
-        Some(codex_dir.display().to_string()),
-        Some("custom".to_string()),
-        |point| match point {
-            MutationPoint::AfterGlobalMainWrite => {
-                assert_eq!(thread_provider(&database, id), "openai");
-                assert!(fs::read_to_string(&rollout)
-                    .expect("read mutated rollout")
-                    .contains("\"model_provider\":\"custom\""));
-                assert!(!global_backup.exists());
-                Err(CodexxError::Config("主状态写入后注入失败".to_string()))
-            }
-            _ => Ok(()),
-        },
-    )
-    .expect_err("fail after global main write");
-
-    assert_eq!(error.to_string(), "配置错误: 主状态写入后注入失败");
-    assert_eq!(thread_provider(&database, id), "openai");
-    assert_eq!(
-        fs::read(&rollout).expect("read restored rollout"),
-        original_rollout
-    );
-    assert_eq!(
-        fs::read(&global).expect("read restored global"),
-        original_global
-    );
-    assert!(!global_backup.exists());
-
-    fs::remove_dir_all(codex_dir).expect("remove test directory");
-}
-
-#[test]
-fn injected_failure_restores_sqlite_jsonl_and_global_state() {
+fn injected_failure_restores_sqlite_and_jsonl_without_touching_global_state() {
     let codex_dir = temp_dir("full-mutation-rollback");
     let id = "019f6000-0000-7000-8000-000000000411";
     let rollout = codex_dir.join(format!("sessions/rollout-test-{id}.jsonl"));
@@ -440,10 +396,11 @@ fn injected_failure_restores_sqlite_jsonl_and_global_state() {
                 assert!(fs::read_to_string(&rollout)
                     .expect("read mutated rollout")
                     .contains("\"model_provider\":\"custom\""));
-                let main = fs::read_to_string(&global).expect("read mutated global state");
-                let backup =
-                    fs::read_to_string(&global_backup).expect("read mutated global backup");
-                assert_eq!(main, backup);
+                assert_eq!(
+                    fs::read(&global).expect("read untouched global state"),
+                    original_global
+                );
+                assert!(!global_backup.exists());
                 Err(CodexxError::Config("测试注入失败".to_string()))
             }
             _ => Ok(()),
@@ -478,10 +435,18 @@ fn injected_failure_restores_sqlite_jsonl_and_global_state() {
         original_global
     );
     assert!(!global_backup.exists());
-    assert!(fs::read_dir(provider_sync_backup_root(&codex_dir))
+    let retained_backup = fs::read_dir(provider_sync_backup_root(&codex_dir))
         .expect("read retained provider sync backup")
         .next()
-        .is_some());
+        .expect("retained provider sync backup")
+        .expect("read retained provider sync backup entry")
+        .path();
+    let metadata = fs::read_to_string(retained_backup.join("metadata.json"))
+        .expect("read retained provider sync metadata");
+    assert!(!metadata.contains("config.toml"));
+    assert!(!metadata.contains(".codex-global-state.json"));
+    assert!(!retained_backup.join("config.toml").exists());
+    assert!(!retained_backup.join(".codex-global-state.json").exists());
 
     drop(wal_guard);
     fs::remove_dir_all(codex_dir).expect("remove test directory");

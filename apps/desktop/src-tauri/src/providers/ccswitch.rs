@@ -1,7 +1,8 @@
 use super::{
-    custom_provider_id, experimental_bearer_token_from_doc, list_saved_providers_on_connection,
-    normalize_saved_provider, open_store, upsert_provider_on_connection, ProviderUpsertKind,
-    ProviderUpsertMode, SavedProvider,
+    consolidate_legacy_provider_duplicates_on_connection, custom_provider_id,
+    experimental_bearer_token_from_doc, list_saved_providers_on_connection,
+    normalize_saved_provider, open_store, upsert_ccswitch_provider_on_connection,
+    ProviderUpsertKind, SavedProvider,
 };
 use crate::ccswitch::{ccswitch_db_candidates, default_ccswitch_db_path};
 use crate::error::{CodexxError, Result};
@@ -314,6 +315,7 @@ pub(crate) fn import_ccswitch_codex_providers_inner(path: Option<String>) -> Res
     let transaction = local_conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| CodexxError::Database(e.to_string()))?;
+    merged += consolidate_legacy_provider_duplicates_on_connection(&transaction)?;
 
     for row in rows_vec {
         if is_official_ccswitch_row(&row) {
@@ -327,11 +329,8 @@ pub(crate) fn import_ccswitch_codex_providers_inner(path: Option<String>) -> Res
         match build_ccswitch_codex_provider(&row, &global_sections) {
             Some(provider) => {
                 let provider = normalize_saved_provider(provider)?;
-                let result = upsert_provider_on_connection(
-                    &transaction,
-                    provider,
-                    ProviderUpsertMode::Imported,
-                )?;
+                let result =
+                    upsert_ccswitch_provider_on_connection(&transaction, provider, row.id.trim())?;
                 match result.kind {
                     ProviderUpsertKind::Added => added += 1,
                     ProviderUpsertKind::Updated => updated += 1,
@@ -348,6 +347,7 @@ pub(crate) fn import_ccswitch_codex_providers_inner(path: Option<String>) -> Res
             }
         }
     }
+    merged += consolidate_legacy_provider_duplicates_on_connection(&transaction)?;
     transaction
         .commit()
         .map_err(|e| CodexxError::Database(e.to_string()))?;
@@ -385,13 +385,22 @@ pub(crate) fn read_ccswitch_official_auth_inner(
         CodexxError::Database(format!("打开 cc-switch 数据库失败 {}: {e}", db.display()))
     })?;
 
+    let provider_columns = table_column_set(&conn, "providers")?;
+    let official_filter = if provider_columns.contains("category") {
+        "id = 'codex-official' OR category = 'official'"
+    } else {
+        // Older cc-switch databases predate the category column. The stable
+        // codex-official id is still enough to identify the official row.
+        "id = 'codex-official'"
+    };
+    let query = format!(
+        "SELECT id, name, settings_config FROM providers
+         WHERE app_type = 'codex' AND ({official_filter})
+         ORDER BY CASE WHEN id = 'codex-official' THEN 0 ELSE 1 END
+         LIMIT 1"
+    );
     let mut stmt = conn
-        .prepare(
-            "SELECT id, name, settings_config FROM providers
-             WHERE app_type = 'codex' AND (id = 'codex-official' OR category = 'official')
-             ORDER BY CASE WHEN id = 'codex-official' THEN 0 ELSE 1 END
-             LIMIT 1",
-        )
+        .prepare(&query)
         .map_err(|e| CodexxError::Database(e.to_string()))?;
 
     let mut rows = stmt

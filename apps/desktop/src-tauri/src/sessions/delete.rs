@@ -1,8 +1,9 @@
 use super::app_server::delete_sessions_via_codex_app_server;
 use super::storage::{
     current_model_provider, discover_sqlite_databases, ensure_sqlite_discovery_writable,
-    scan_rollouts, split_line_ending, sqlite_subagent_thread_ids, sqlite_thread_needs_alignment,
-    SqliteDiscovery, SqliteThreadIndexState,
+    is_canonical_rollout_storage_path, rollout_filename_matches_id, scan_rollouts,
+    split_line_ending, sqlite_subagent_thread_ids, sqlite_thread_needs_alignment, SqliteDiscovery,
+    SqliteThreadIndexState,
 };
 use super::sync::{acquire_session_maintenance_lock, session_sync_status_with_discovery};
 use super::types::SessionSyncStatus;
@@ -385,30 +386,6 @@ fn collect_rollout_storage_paths(root: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
-}
-
-fn rollout_filename_matches_id(path: &Path, id: &str) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            name.ends_with(&format!("-{id}.jsonl")) || name.ends_with(&format!("-{id}.jsonl.zst"))
-        })
-}
-
-fn canonical_rollout_storage_roots(codex_dir: &Path) -> Vec<PathBuf> {
-    [
-        codex_dir.join("sessions"),
-        codex_dir.join("archived_sessions"),
-    ]
-    .into_iter()
-    .filter_map(|root| root.canonicalize().ok())
-    .collect()
-}
-
-fn is_canonical_rollout_storage_path(codex_dir: &Path, path: &Path) -> bool {
-    canonical_rollout_storage_roots(codex_dir)
-        .iter()
-        .any(|root| path.starts_with(root))
 }
 
 fn canonical_rollout_path(codex_dir: &Path, value: &str, id: &str) -> Result<Option<PathBuf>> {
@@ -932,6 +909,11 @@ pub(crate) fn delete_codex_sessions_inner(
                 .intersection(&storage_before.subagent_ids)
                 .count();
             let deleted_top_level = deleted_active_ids.len().saturating_sub(deleted_subagents);
+            let deleted_mismatched_sessions = fallback
+                .sessions
+                .iter()
+                .filter(|item| item.needs_sync && deleted_active_ids.contains(&item.id))
+                .count();
             fallback
                 .sessions
                 .retain(|item| !counts.deleted_ids.contains(&item.id));
@@ -944,7 +926,10 @@ pub(crate) fn delete_codex_sessions_inner(
             fallback.mismatched_threads = fallback
                 .mismatched_threads
                 .saturating_sub(deleted_mismatched);
-            fallback.needs_sync = fallback.mismatched_threads > 0;
+            fallback.mismatched_sessions = fallback
+                .mismatched_sessions
+                .saturating_sub(deleted_mismatched_sessions);
+            fallback.needs_sync = fallback.mismatched_sessions > 0;
             fallback.warnings.push(message);
             fallback
         }

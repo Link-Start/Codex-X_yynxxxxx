@@ -2,6 +2,7 @@ use crate::error::{CodexxError, Result};
 use chrono::Local;
 use serde_json::Value;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 use toml_edit::DocumentMut;
@@ -107,6 +108,29 @@ pub(crate) fn read_to_string_if_exists(path: &Path) -> Result<String> {
     fs::read_to_string(path).map_err(|e| io_err(path, e))
 }
 
+pub(crate) fn harden_sensitive_file_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(io_err(path, error)),
+        };
+        if !metadata.is_file() || metadata.permissions().mode() & 0o777 == 0o600 {
+            return Ok(());
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| io_err(path, error))?;
+    }
+
+    #[cfg(not(unix))]
+    let _ = path;
+
+    Ok(())
+}
+
 pub(crate) fn parse_toml_document(path: &Path, text: &str) -> Result<DocumentMut> {
     if text.trim().is_empty() {
         return Ok(DocumentMut::new());
@@ -117,7 +141,55 @@ pub(crate) fn parse_toml_document(path: &Path, text: &str) -> Result<DocumentMut
     })
 }
 
-pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+#[cfg(unix)]
+fn atomic_write_mode(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sensitive = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "config.toml" | "auth.json"));
+    if sensitive {
+        return Some(0o600);
+    }
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions().mode() & 0o777)
+}
+
+fn create_atomic_temp(path: &Path, tmp: &Path, private: bool) -> Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mode = private.then_some(0o600).or_else(|| atomic_write_mode(path));
+        if let Some(mode) = mode {
+            options.mode(mode);
+            let file = options.open(tmp).map_err(|error| io_err(tmp, error))?;
+            fs::set_permissions(tmp, fs::Permissions::from_mode(mode))
+                .map_err(|error| io_err(tmp, error))?;
+            return Ok(file);
+        }
+    }
+
+    #[cfg(not(unix))]
+    let _ = private;
+
+    options.open(tmp).map_err(|error| io_err(tmp, error))
+}
+
+fn atomic_write_with_privacy_and_check<F>(
+    path: &Path,
+    bytes: &[u8],
+    private: bool,
+    pre_commit: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
     use std::sync::atomic::{AtomicU64, Ordering};
     static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
     if let Some(parent) = path.parent() {
@@ -129,13 +201,29 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         Local::now().timestamp_nanos_opt().unwrap_or_default(),
         WRITE_COUNTER.fetch_add(1, Ordering::Relaxed),
     ));
-    {
-        let mut file = fs::File::create(&tmp).map_err(|e| io_err(&tmp, e))?;
+    let result = (|| {
+        let mut file = create_atomic_temp(path, &tmp, private)?;
         file.write_all(bytes).map_err(|e| io_err(&tmp, e))?;
         file.sync_all().map_err(|e| io_err(&tmp, e))?;
+        drop(file);
+        pre_commit()?;
+        fs::rename(&tmp, path).map_err(|e| io_err(path, e))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(&tmp, path).map_err(|e| io_err(path, e))?;
-    Ok(())
+    result
+}
+
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write_with_privacy_and_check(path, bytes, false, || Ok(()))
+}
+
+pub(crate) fn atomic_write_checked<F>(path: &Path, bytes: &[u8], pre_commit: F) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    atomic_write_with_privacy_and_check(path, bytes, false, pre_commit)
 }
 
 pub(crate) fn write_text(path: &Path, text: &str) -> Result<()> {
@@ -145,6 +233,11 @@ pub(crate) fn write_text(path: &Path, text: &str) -> Result<()> {
 pub(crate) fn write_json(path: &Path, value: &Value) -> Result<()> {
     let text = serde_json::to_string_pretty(value).map_err(|e| json_err(path, e))?;
     write_text(path, &(text + "\n"))
+}
+
+pub(crate) fn write_private_json(path: &Path, value: &Value) -> Result<()> {
+    let text = serde_json::to_string_pretty(value).map_err(|e| json_err(path, e))?;
+    atomic_write_with_privacy_and_check(path, (text + "\n").as_bytes(), true, || Ok(()))
 }
 
 #[cfg(test)]
@@ -179,6 +272,91 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(entries, vec![path.file_name().unwrap().to_os_string()]);
 
+        fs::remove_dir_all(dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn checked_atomic_write_rejects_a_change_immediately_before_replace() {
+        let dir = temp_dir("checked-race");
+        let path = dir.join("config.toml");
+        fs::write(&path, b"old").expect("write original file");
+
+        let error = atomic_write_checked(&path, b"codex-x", || {
+            fs::write(&path, b"external").expect("simulate external writer");
+            Err(CodexxError::Config("stale snapshot".to_string()))
+        })
+        .expect_err("stale checked write must fail");
+
+        assert!(error.to_string().contains("stale snapshot"));
+        assert_eq!(fs::read(&path).expect("read external value"), b"external");
+        assert_eq!(fs::read_dir(&dir).expect("read directory").count(), 1);
+        fs::remove_dir_all(dir).expect("remove test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_restricts_sensitive_codex_files_and_preserves_other_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("permissions");
+        let config = dir.join("config.toml");
+        let auth = dir.join("auth.json");
+        let script = dir.join("tool.sh");
+        for path in [&config, &auth, &script] {
+            fs::write(path, b"old").expect("seed file");
+        }
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).expect("set config mode");
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o644)).expect("set auth mode");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("set script mode");
+
+        atomic_write(&config, b"new config").expect("replace config");
+        atomic_write(&auth, b"new auth").expect("replace auth");
+        atomic_write(&script, b"new script").expect("replace script");
+
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&config), 0o600);
+        assert_eq!(mode(&auth), 0o600);
+        assert_eq!(mode(&script), 0o755);
+        fs::remove_dir_all(dir).expect("remove test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn harden_sensitive_permissions_updates_existing_files_without_creating_missing_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("harden-permissions");
+        let config = dir.join("config.toml");
+        let missing = dir.join("auth.json");
+        fs::write(&config, b"model = \"gpt\"\n").expect("seed config");
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).expect("set open mode");
+
+        harden_sensitive_file_permissions(&config).expect("harden config");
+        harden_sensitive_file_permissions(&missing).expect("ignore missing auth");
+
+        assert_eq!(
+            fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(!missing.exists());
+        fs::remove_dir_all(dir).expect("remove test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_json_is_private_from_its_first_atomic_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("private-json");
+        let path = dir.join("official-snapshot.json");
+
+        write_private_json(&path, &serde_json::json!({"token": "secret"}))
+            .expect("write private JSON");
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         fs::remove_dir_all(dir).expect("remove test directory");
     }
 

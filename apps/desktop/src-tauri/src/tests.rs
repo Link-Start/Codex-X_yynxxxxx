@@ -133,6 +133,8 @@ fn provider_test_connection() -> Connection {
                 toml_config TEXT,
                 wire_api TEXT NOT NULL DEFAULT 'responses',
                 requires_openai_auth INTEGER NOT NULL DEFAULT 1,
+                source TEXT NOT NULL DEFAULT 'manual',
+                source_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );",
@@ -334,32 +336,31 @@ experimental_bearer_token = "sk-same"
         None,
     ))
     .expect("normalize import");
-    let result =
-        upsert_provider_on_connection(&conn, imported.clone(), ProviderUpsertMode::Imported)
-            .expect("merge import");
+    let result = upsert_ccswitch_provider_on_connection(&conn, imported.clone(), "cc-switch-id")
+        .expect("merge import");
     assert_eq!(result.kind, ProviderUpsertKind::Merged);
     assert_eq!(result.provider.id, "local");
     assert_eq!(result.provider.provider_name, "Local Name");
     assert_eq!(result.provider.model, "local-model");
-    assert_eq!(
-        result.provider.toml_config.as_deref(),
-        Some(local_toml.trim_end())
-    );
+    let normalized_toml = result.provider.toml_config.as_deref().unwrap();
+    assert!(normalized_toml.contains("name = \"Local Name\""));
+    assert!(normalized_toml.contains("wire_api = \"responses\""));
+    assert!(!normalized_toml.contains("experimental_bearer_token"));
     assert_eq!(list_saved_providers_on_connection(&conn).unwrap().len(), 1);
 
-    let repeated = upsert_provider_on_connection(&conn, imported, ProviderUpsertMode::Imported)
+    let repeated = upsert_ccswitch_provider_on_connection(&conn, imported, "cc-switch-id")
         .expect("repeat identical import");
     assert_eq!(repeated.provider.id, "local");
     assert_eq!(
         repeated.provider.toml_config.as_deref(),
-        Some(local_toml.trim_end())
+        Some(normalized_toml)
     );
     assert_eq!(list_saved_providers_on_connection(&conn).unwrap().len(), 1);
 }
 
 #[test]
-fn provider_migration_merges_only_exact_nonempty_credentials() {
-    let mut conn = provider_test_connection();
+fn provider_migration_keeps_the_latest_exact_credential_record() {
+    let conn = provider_test_connection();
     let first = provider_fixture(
         "first-id",
         "Local Name",
@@ -431,12 +432,20 @@ fn provider_migration_merges_only_exact_nonempty_credentials() {
         "2026-05-01T00:00:00Z",
     );
 
-    assert_eq!(merge_duplicate_provider_identities(&mut conn).unwrap(), 1);
+    assert_eq!(
+        list_saved_providers_on_connection(&conn).unwrap().len(),
+        5,
+        "read-only listing must not delete legacy duplicates"
+    );
+    assert_eq!(
+        consolidate_legacy_provider_duplicates_on_connection(&conn).unwrap(),
+        1
+    );
     let rows = list_saved_providers_on_connection(&conn).unwrap();
     assert_eq!(rows.len(), 4);
-    let survivor = rows.iter().find(|row| row.id == "first-id").unwrap();
-    assert_eq!(survivor.provider_name, "Local Name");
-    assert_eq!(survivor.model, "local-model");
+    let survivor = rows.iter().find(|row| row.id == "later-id").unwrap();
+    assert_eq!(survivor.provider_name, "Imported Name");
+    assert_eq!(survivor.model, "imported-model");
     assert_eq!(
         survivor.toml_config.as_deref(),
         Some("local preserved toml")
@@ -444,7 +453,7 @@ fn provider_migration_merges_only_exact_nonempty_credentials() {
     assert!(rows.iter().any(|row| row.id == "different-key"));
     assert!(rows.iter().any(|row| row.id == "anonymous-a"));
     assert!(rows.iter().any(|row| row.id == "anonymous-b"));
-    assert!(!rows.iter().any(|row| row.id == "later-id"));
+    assert!(!rows.iter().any(|row| row.id == "first-id"));
 }
 
 #[test]
@@ -482,35 +491,6 @@ fn provider_slug_collision_does_not_overwrite_an_unrelated_id() {
 }
 
 #[test]
-fn detected_provider_id_collision_gets_a_unique_id() {
-    let conn = provider_test_connection();
-    let existing = normalize_saved_provider(provider_fixture(
-        "custom",
-        "Existing",
-        "https://first.example/v1",
-        Some("sk-first"),
-        "first",
-        None,
-    ))
-    .unwrap();
-    upsert_provider_on_connection(&conn, existing, ProviderUpsertMode::Manual).unwrap();
-    let detected = normalize_saved_provider(provider_fixture(
-        "custom",
-        "Detected",
-        "https://second.example/v1",
-        Some("sk-second"),
-        "second",
-        None,
-    ))
-    .unwrap();
-    let result = upsert_provider_on_connection(&conn, detected, ProviderUpsertMode::Detected)
-        .expect("save collision safely");
-    assert_eq!(result.kind, ProviderUpsertKind::Added);
-    assert_eq!(result.provider.id, "custom-2");
-    assert_eq!(list_saved_providers_on_connection(&conn).unwrap().len(), 2);
-}
-
-#[test]
 fn ccswitch_row_reader_supports_legacy_schema_without_category() {
     let conn = Connection::open_in_memory().expect("open legacy cc-switch database");
     conn.execute_batch(
@@ -539,6 +519,37 @@ fn ccswitch_row_reader_supports_legacy_schema_without_category() {
         category: None,
     };
     assert!(is_official_ccswitch_row(&official));
+}
+
+#[test]
+fn ccswitch_official_auth_reader_supports_legacy_schema_without_category() {
+    let db_path = temp_codex_dir("legacy-ccswitch-official").join("cc-switch.db");
+    let conn = Connection::open(&db_path).expect("open legacy cc-switch database");
+    conn.execute_batch(
+        "CREATE TABLE providers (
+                id TEXT NOT NULL,
+                app_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                settings_config TEXT NOT NULL,
+                sort_index INTEGER,
+                created_at INTEGER,
+                PRIMARY KEY (id, app_type)
+            );
+            INSERT INTO providers
+                (id, app_type, name, settings_config, sort_index, created_at)
+            VALUES
+                ('codex-official', 'codex', 'OpenAI Official',
+                 '{\"auth\":{\"auth_mode\":\"chatgpt\",\"tokens\":{\"access_token\":\"token\"}}}',
+                 0, 1);",
+    )
+    .expect("seed legacy official provider");
+    drop(conn);
+
+    assert!(
+        read_ccswitch_official_auth_inner(Some(db_path.display().to_string()))
+            .expect("read legacy official auth")
+            .is_some()
+    );
 }
 
 #[test]
@@ -1034,6 +1045,50 @@ fn replace_mode_keeps_unrelated_agents_content() {
 }
 
 #[test]
+fn prompt_enable_rolls_back_config_prompt_and_agents_when_final_state_fails() {
+    let codex_dir = temp_codex_dir("prompt-final-state-rollback");
+    write_text(&config_path(&codex_dir), "model = \"before\"\n").expect("write config");
+    write_text(&auth_path(&codex_dir), "{malformed-auth").expect("write malformed auth");
+    let agents_before = install_managed_agents_block_in_content(
+        "# User AGENTS\nkeep this\n",
+        "builtin:previous",
+        "previous managed prompt",
+    )
+    .expect("build managed AGENTS fixture");
+    write_text(&agents_path(&codex_dir), &agents_before).expect("write AGENTS fixture");
+    let config_before = fs::read(config_path(&codex_dir)).expect("snapshot config");
+    let target = codex_dir.join(INSTRUCTION_FILENAME);
+
+    let error = enable_prompt_content_inner(
+        Some(codex_dir.display().to_string()),
+        INSTRUCTION_FILENAME,
+        "replacement prompt",
+        "builtin:gpt5.5-unrestricted",
+        "managed",
+        "test",
+        PromptInjectionMode::Replace,
+        "test-final-state-rollback",
+    )
+    .expect_err("malformed auth must fail final state construction");
+
+    assert!(error.to_string().contains("auth.json"));
+    assert_eq!(
+        fs::read(config_path(&codex_dir)).expect("read rolled back config"),
+        config_before
+    );
+    assert_eq!(
+        fs::read_to_string(agents_path(&codex_dir)).expect("read rolled back AGENTS"),
+        agents_before
+    );
+    assert!(!target.exists());
+    assert_eq!(
+        fs::read_to_string(auth_path(&codex_dir)).expect("read preserved auth"),
+        "{malformed-auth"
+    );
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
 fn restore_backup_restores_agents_file_alongside_config() {
     let codex_dir = temp_codex_dir("restore-agents");
     write_text(&config_path(&codex_dir), "model = \"gpt-5.5\"\n").expect("write config");
@@ -1055,6 +1110,350 @@ fn restore_backup_restores_agents_file_alongside_config() {
         "# Original AGENTS\n"
     );
     let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
+fn restore_backup_rolls_back_all_live_files_when_restored_auth_is_malformed() {
+    let codex_dir = temp_codex_dir("restore-malformed-auth-rollback");
+    write_text(&config_path(&codex_dir), "model = \"backup-model\"\n")
+        .expect("write backup config");
+    write_text(
+        &auth_path(&codex_dir),
+        "{\"auth_mode\":\"chatgpt\",\"tokens\":{\"access_token\":\"backup\"}}\n",
+    )
+    .expect("write backup auth");
+    write_text(&agents_path(&codex_dir), "# Backup AGENTS\n").expect("write backup agents");
+    let backup_id = create_backup(&codex_dir, "malformed-auth-target")
+        .expect("create target backup")
+        .expect("target backup id");
+    let backup_dir = action_backup_root(&codex_dir)
+        .expect("resolve backup root")
+        .join(&backup_id);
+    fs::write(backup_dir.join("auth.json"), b"{malformed-auth").expect("corrupt backup auth");
+
+    write_text(&config_path(&codex_dir), "model = \"current-model\"\n")
+        .expect("write current config");
+    write_text(
+        &auth_path(&codex_dir),
+        "{\"auth_mode\":\"chatgpt\",\"tokens\":{\"access_token\":\"current\"}}\n",
+    )
+    .expect("write current auth");
+    write_text(&agents_path(&codex_dir), "# Current AGENTS\n").expect("write current agents");
+    let config_before = fs::read(config_path(&codex_dir)).expect("snapshot current config");
+    let auth_before = fs::read(auth_path(&codex_dir)).expect("snapshot current auth");
+    let agents_before = fs::read(agents_path(&codex_dir)).expect("snapshot current agents");
+
+    restore_backup_inner(Some(codex_dir.display().to_string()), backup_id)
+        .expect_err("malformed restored auth must fail");
+
+    assert_eq!(
+        fs::read(config_path(&codex_dir)).expect("read rolled back config"),
+        config_before
+    );
+    assert_eq!(
+        fs::read(auth_path(&codex_dir)).expect("read rolled back auth"),
+        auth_before
+    );
+    assert_eq!(
+        fs::read(agents_path(&codex_dir)).expect("read rolled back agents"),
+        agents_before
+    );
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
+fn restore_backup_rejects_malformed_metadata_without_touching_live_files() {
+    let codex_dir = temp_codex_dir("restore-malformed-meta");
+    write_text(&config_path(&codex_dir), "model = \"current\"\n").expect("write config");
+    write_text(&auth_path(&codex_dir), "{\"OPENAI_API_KEY\":\"current\"}\n").expect("write auth");
+    write_text(&agents_path(&codex_dir), "# Current AGENTS\n").expect("write agents");
+    let backup_id = create_backup(&codex_dir, "malformed-meta")
+        .expect("create backup")
+        .expect("backup id");
+    let backup_dir = action_backup_root(&codex_dir)
+        .expect("resolve backup root")
+        .join(&backup_id);
+    fs::write(backup_dir.join("meta.json"), b"{malformed-meta").expect("corrupt backup metadata");
+    let config_before = fs::read(config_path(&codex_dir)).expect("snapshot config");
+    let auth_before = fs::read(auth_path(&codex_dir)).expect("snapshot auth");
+    let agents_before = fs::read(agents_path(&codex_dir)).expect("snapshot agents");
+
+    let error = restore_backup_inner(Some(codex_dir.display().to_string()), backup_id)
+        .expect_err("malformed metadata must fail");
+
+    assert!(error.to_string().contains("meta.json"));
+    assert_eq!(fs::read(config_path(&codex_dir)).unwrap(), config_before);
+    assert_eq!(fs::read(auth_path(&codex_dir)).unwrap(), auth_before);
+    assert_eq!(fs::read(agents_path(&codex_dir)).unwrap(), agents_before);
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
+fn restore_backup_rejects_path_traversal_ids() {
+    let codex_dir = temp_codex_dir("restore-path-traversal");
+    let error = restore_backup_inner(
+        Some(codex_dir.display().to_string()),
+        "../outside".to_string(),
+    )
+    .expect_err("path traversal backup id must fail");
+    assert!(error.to_string().contains("备份 ID 无效"));
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
+fn restore_backup_rejects_a_backup_from_another_codex_home() {
+    let source = temp_codex_dir("restore-cross-home-source");
+    let target = temp_codex_dir("restore-cross-home-target");
+    write_text(&config_path(&source), "model = \"source\"\n").expect("write source config");
+    write_text(&auth_path(&source), "{\"OPENAI_API_KEY\":\"source\"}\n")
+        .expect("write source auth");
+    write_text(&agents_path(&source), "# Source AGENTS\n").expect("write source agents");
+    let backup_id = create_backup(&source, "cross-home")
+        .expect("create source backup")
+        .expect("source backup id");
+    let source_backup = action_backup_root(&source)
+        .expect("resolve source backup root")
+        .join(&backup_id);
+    let target_backup = action_backup_root(&target)
+        .expect("resolve target backup root")
+        .join(&backup_id);
+    fs::create_dir_all(&target_backup).expect("create copied backup directory");
+    for filename in ["meta.json", "config.toml", "auth.json", AGENTS_FILENAME] {
+        fs::copy(source_backup.join(filename), target_backup.join(filename))
+            .expect("copy source backup file");
+    }
+
+    write_text(&config_path(&target), "model = \"target\"\n").expect("write target config");
+    write_text(&auth_path(&target), "{\"OPENAI_API_KEY\":\"target\"}\n")
+        .expect("write target auth");
+    write_text(&agents_path(&target), "# Target AGENTS\n").expect("write target agents");
+    let config_before = fs::read(config_path(&target)).expect("snapshot target config");
+    let auth_before = fs::read(auth_path(&target)).expect("snapshot target auth");
+    let agents_before = fs::read(agents_path(&target)).expect("snapshot target agents");
+
+    let error = restore_backup_inner(Some(target.display().to_string()), backup_id)
+        .expect_err("cross-CODEX_HOME restore must fail");
+
+    assert!(error.to_string().contains("其他 CODEX_HOME"));
+    assert_eq!(fs::read(config_path(&target)).unwrap(), config_before);
+    assert_eq!(fs::read(auth_path(&target)).unwrap(), auth_before);
+    assert_eq!(fs::read(agents_path(&target)).unwrap(), agents_before);
+    let _ = fs::remove_dir_all(source);
+    let _ = fs::remove_dir_all(target);
+}
+
+#[test]
+fn restore_backup_rejects_missing_metadata_without_touching_live_files() {
+    let codex_dir = temp_codex_dir("restore-missing-meta");
+    write_text(&config_path(&codex_dir), "model = \"backup\"\n").expect("write backup config");
+    let backup_id = create_backup(&codex_dir, "missing-meta")
+        .expect("create backup")
+        .expect("backup id");
+    let backup_dir = action_backup_root(&codex_dir)
+        .expect("resolve backup root")
+        .join(&backup_id);
+    fs::remove_file(backup_dir.join("meta.json")).expect("remove backup metadata");
+    write_text(&config_path(&codex_dir), "model = \"current\"\n").expect("write current config");
+    let config_before = fs::read(config_path(&codex_dir)).expect("snapshot config");
+
+    let error = restore_backup_inner(Some(codex_dir.display().to_string()), backup_id)
+        .expect_err("missing metadata must fail");
+
+    assert!(error.to_string().contains("缺少元数据"));
+    assert_eq!(fs::read(config_path(&codex_dir)).unwrap(), config_before);
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
+fn restore_backup_rejects_each_declared_but_missing_file_before_live_changes() {
+    let codex_dir = temp_codex_dir("restore-declared-file-missing");
+    write_text(&config_path(&codex_dir), "model = \"backup\"\n").expect("write backup config");
+    write_text(&auth_path(&codex_dir), "{\"OPENAI_API_KEY\":\"backup\"}\n")
+        .expect("write backup auth");
+    write_text(&agents_path(&codex_dir), "# Backup AGENTS\n").expect("write backup agents");
+    let backup_id = create_backup(&codex_dir, "declared-files")
+        .expect("create backup")
+        .expect("backup id");
+    let backup_dir = action_backup_root(&codex_dir)
+        .expect("resolve backup root")
+        .join(&backup_id);
+    write_text(&config_path(&codex_dir), "model = \"current\"\n").expect("write current config");
+    write_text(&auth_path(&codex_dir), "{\"OPENAI_API_KEY\":\"current\"}\n")
+        .expect("write current auth");
+    write_text(&agents_path(&codex_dir), "# Current AGENTS\n").expect("write current agents");
+    let config_before = fs::read(config_path(&codex_dir)).expect("snapshot config");
+    let auth_before = fs::read(auth_path(&codex_dir)).expect("snapshot auth");
+    let agents_before = fs::read(agents_path(&codex_dir)).expect("snapshot agents");
+
+    for filename in ["config.toml", "auth.json", AGENTS_FILENAME] {
+        let path = backup_dir.join(filename);
+        let bytes = fs::read(&path).expect("snapshot declared backup file");
+        fs::remove_file(&path).expect("remove declared backup file");
+
+        let error = restore_backup_inner(Some(codex_dir.display().to_string()), backup_id.clone())
+            .expect_err("missing declared backup file must fail");
+
+        assert!(error.to_string().contains(filename));
+        assert_eq!(fs::read(config_path(&codex_dir)).unwrap(), config_before);
+        assert_eq!(fs::read(auth_path(&codex_dir)).unwrap(), auth_before);
+        assert_eq!(fs::read(agents_path(&codex_dir)).unwrap(), agents_before);
+        fs::write(path, bytes).expect("restore declared backup fixture");
+    }
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_backup_rejects_a_declared_symlink_file_before_live_changes() {
+    use std::os::unix::fs::symlink;
+
+    let codex_dir = temp_codex_dir("restore-declared-symlink");
+    write_text(&config_path(&codex_dir), "model = \"backup\"\n").expect("write backup config");
+    let backup_id = create_backup(&codex_dir, "declared-symlink")
+        .expect("create backup")
+        .expect("backup id");
+    let backup_dir = action_backup_root(&codex_dir)
+        .expect("resolve backup root")
+        .join(&backup_id);
+    let backup_config = backup_dir.join("config.toml");
+    fs::remove_file(&backup_config).expect("remove ordinary backup config");
+    let linked_target = backup_dir.join("linked-config.toml");
+    fs::write(&linked_target, "model = \"linked\"\n").expect("write symlink target");
+    symlink(&linked_target, &backup_config).expect("create backup config symlink");
+    write_text(&config_path(&codex_dir), "model = \"current\"\n").expect("write current config");
+    let config_before = fs::read(config_path(&codex_dir)).expect("snapshot current config");
+
+    let error = restore_backup_inner(Some(codex_dir.display().to_string()), backup_id)
+        .expect_err("declared symlink backup file must fail");
+
+    assert!(error.to_string().contains("不是普通文件"));
+    assert_eq!(fs::read(config_path(&codex_dir)).unwrap(), config_before);
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
+fn restore_backup_rejects_extra_payload_files_when_presence_flags_are_false() {
+    let codex_dir = temp_codex_dir("restore-false-presence-flags");
+    let backup_id = create_backup(&codex_dir, "absent-files")
+        .expect("create empty backup")
+        .expect("backup id");
+    let backup_dir = action_backup_root(&codex_dir)
+        .expect("resolve backup root")
+        .join(&backup_id);
+    write_text(&config_path(&codex_dir), "model = \"current\"\n").expect("write current config");
+    write_text(&auth_path(&codex_dir), "{\"OPENAI_API_KEY\":\"current\"}\n")
+        .expect("write current auth");
+    write_text(&agents_path(&codex_dir), "# Current AGENTS\n").expect("write current agents");
+    let config_before = fs::read(config_path(&codex_dir)).expect("snapshot config");
+    let auth_before = fs::read(auth_path(&codex_dir)).expect("snapshot auth");
+    let agents_before = fs::read(agents_path(&codex_dir)).expect("snapshot agents");
+
+    for (filename, contents) in [
+        ("config.toml", "model = \"extra\"\n"),
+        ("auth.json", "{\"OPENAI_API_KEY\":\"extra\"}\n"),
+        (AGENTS_FILENAME, "# Extra AGENTS\n"),
+    ] {
+        let extra = backup_dir.join(filename);
+        fs::write(&extra, contents).expect("write extra backup payload");
+
+        let error = restore_backup_inner(Some(codex_dir.display().to_string()), backup_id.clone())
+            .expect_err("undeclared backup payload must fail");
+
+        assert!(error.to_string().contains("多余文件"));
+        assert!(error.to_string().contains(filename));
+        assert_eq!(fs::read(config_path(&codex_dir)).unwrap(), config_before);
+        assert_eq!(fs::read(auth_path(&codex_dir)).unwrap(), auth_before);
+        assert_eq!(fs::read(agents_path(&codex_dir)).unwrap(), agents_before);
+        fs::remove_file(extra).expect("remove extra backup payload");
+    }
+
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
+fn restore_backup_deletes_live_files_declared_absent_from_a_clean_backup() {
+    let codex_dir = temp_codex_dir("restore-clean-absent-files");
+    let backup_id = create_backup(&codex_dir, "absent-files")
+        .expect("create empty backup")
+        .expect("backup id");
+    write_text(&config_path(&codex_dir), "model = \"current\"\n").expect("write current config");
+    write_text(&auth_path(&codex_dir), "{\"OPENAI_API_KEY\":\"current\"}\n")
+        .expect("write current auth");
+    write_text(&agents_path(&codex_dir), "# Current AGENTS\n").expect("write current agents");
+
+    restore_backup_inner(Some(codex_dir.display().to_string()), backup_id)
+        .expect("restore clean declared-absent files");
+
+    assert!(!config_path(&codex_dir).exists());
+    assert!(!auth_path(&codex_dir).exists());
+    assert!(!agents_path(&codex_dir).exists());
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
+fn restore_backup_rejects_metadata_id_mismatch_without_touching_live_files() {
+    let codex_dir = temp_codex_dir("restore-mismatched-meta-id");
+    write_text(&config_path(&codex_dir), "model = \"backup\"\n").expect("write backup config");
+    write_text(&auth_path(&codex_dir), "{\"OPENAI_API_KEY\":\"backup\"}\n")
+        .expect("write backup auth");
+    write_text(&agents_path(&codex_dir), "# Backup AGENTS\n").expect("write backup agents");
+    let backup_id = create_backup(&codex_dir, "mismatched-meta-id")
+        .expect("create backup")
+        .expect("backup id");
+    let meta_path = action_backup_root(&codex_dir)
+        .expect("resolve backup root")
+        .join(&backup_id)
+        .join("meta.json");
+    let mut meta: Value = serde_json::from_slice(&fs::read(&meta_path).expect("read metadata"))
+        .expect("parse metadata");
+    meta["id"] = json!("different-backup-id");
+    write_json(&meta_path, &meta).expect("write mismatched metadata id");
+
+    write_text(&config_path(&codex_dir), "model = \"current\"\n").expect("write current config");
+    write_text(&auth_path(&codex_dir), "{\"OPENAI_API_KEY\":\"current\"}\n")
+        .expect("write current auth");
+    write_text(&agents_path(&codex_dir), "# Current AGENTS\n").expect("write current agents");
+    let config_before = fs::read(config_path(&codex_dir)).expect("snapshot config");
+    let auth_before = fs::read(auth_path(&codex_dir)).expect("snapshot auth");
+    let agents_before = fs::read(agents_path(&codex_dir)).expect("snapshot agents");
+
+    let error = restore_backup_inner(Some(codex_dir.display().to_string()), backup_id)
+        .expect_err("mismatched metadata id must fail");
+
+    assert!(error.to_string().contains("ID 与请求不一致"));
+    assert_eq!(fs::read(config_path(&codex_dir)).unwrap(), config_before);
+    assert_eq!(fs::read(auth_path(&codex_dir)).unwrap(), auth_before);
+    assert_eq!(fs::read(agents_path(&codex_dir)).unwrap(), agents_before);
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
+fn backup_codex_home_identity_accepts_equivalent_missing_paths() {
+    let root = temp_codex_dir("backup-missing-path-identity");
+    let missing = root.join("future").join("codex-home");
+    let equivalent = root
+        .join("future")
+        .join("nested")
+        .join("..")
+        .join("codex-home");
+    let meta = BackupMeta {
+        id: "missing-path".to_string(),
+        action: "test".to_string(),
+        created_at: Local::now().to_rfc3339(),
+        codex_dir: equivalent.display().to_string(),
+        config_path: String::new(),
+        auth_path: String::new(),
+        had_config: false,
+        had_auth: false,
+        agents_path: String::new(),
+        had_agents: false,
+        tracks_agents: true,
+    };
+
+    validate_backup_codex_dir(&meta, &missing)
+        .expect("equivalent missing CODEX_HOME paths must match");
+    assert!(!missing.exists());
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1107,7 +1506,7 @@ description: Keep long investigations aligned.
 }
 
 #[test]
-fn switch_provider_writes_scoped_bearer_without_overwriting_official_auth() {
+fn switch_provider_scopes_api_key_and_preserves_official_auth() {
     let codex_dir = temp_codex_dir("switch-provider");
     let official_auth = json!({
         "auth_mode": "chatgpt",
@@ -1118,11 +1517,9 @@ fn switch_provider_writes_scoped_bearer_without_overwriting_official_auth() {
         "last_refresh": "2026-07-24T00:00:00Z"
     });
     write_json(&auth_path(&codex_dir), &official_auth).expect("write official auth");
-    let auth_before = fs::read(auth_path(&codex_dir)).expect("read official auth before switch");
-
     let result = switch_provider_inner(ProviderInput {
         config_dir: Some(codex_dir.display().to_string()),
-        _provider_id: Some("magicai".to_string()),
+        provider_id: Some("magicai".to_string()),
         provider_name: "MagicAI".to_string(),
         base_url: "https://example.com/v1/".to_string(),
         model: "gpt-5.5".to_string(),
@@ -1150,19 +1547,80 @@ fn switch_provider_writes_scoped_bearer_without_overwriting_official_auth() {
     );
     assert!(config_doc.get("experimental_bearer_token").is_none());
 
-    let auth_after = fs::read(auth_path(&codex_dir)).expect("read official auth after switch");
-    assert_eq!(auth_after, auth_before);
+    let live_auth: Value = serde_json::from_str(
+        &fs::read_to_string(auth_path(&codex_dir)).expect("read provider auth after switch"),
+    )
+    .expect("parse provider auth");
+    assert_eq!(live_auth, official_auth);
+
+    let official = switch_official_provider_inner(Some(codex_dir.display().to_string()))
+        .expect("switch back to official");
+    assert_eq!(official.state.model_provider.as_deref(), Some("custom"));
+    assert!(official.state.is_official_provider);
+    let restored_auth: Value = serde_json::from_str(
+        &fs::read_to_string(auth_path(&codex_dir)).expect("read restored official auth"),
+    )
+    .expect("parse restored official auth");
+    assert_eq!(restored_auth, official_auth);
 
     let _ = fs::remove_dir_all(codex_dir);
 }
 
 #[test]
-fn switch_provider_persists_detected_custom_before_overwrite() {
+fn switch_provider_round_trip_restores_official_api_key() {
+    let codex_dir = temp_codex_dir("switch-provider-official-api-key-round-trip");
+    write_text(
+        &config_path(&codex_dir),
+        "model_provider = \"openai\"\nmodel = \"official-model\"\n",
+    )
+    .expect("write official config");
+    let official_auth = json!({
+        "OPENAI_API_KEY": "sk-official-api-key",
+        "auth_mode": "apikey"
+    });
+    write_json(&auth_path(&codex_dir), &official_auth).expect("write official API-key auth");
+    let snapshot_path = providers::official_snapshot_path_for_test(&codex_dir)
+        .expect("resolve official snapshot path");
+    let _ = fs::remove_file(&snapshot_path);
+
+    assert!(!capture_live_chatgpt_config(&codex_dir).expect("refresh official auth state"));
+    assert!(!snapshot_path.exists());
+
+    switch_provider_inner(ProviderInput {
+        config_dir: Some(codex_dir.display().to_string()),
+        provider_id: Some("proxy".to_string()),
+        provider_name: "Proxy".to_string(),
+        base_url: "https://proxy.example.com/v1".to_string(),
+        model: "proxy-model".to_string(),
+        api_key: Some("sk-proxy".to_string()),
+        wire_api: Some("responses".to_string()),
+        requires_openai_auth: Some(false),
+    })
+    .expect("switch to proxy");
+    assert!(snapshot_path.is_file());
+
+    let result = switch_official_provider_inner(Some(codex_dir.display().to_string()))
+        .expect("switch back to official API-key config");
+    assert!(result.state.is_official_provider);
+    assert_eq!(result.state.model.as_deref(), Some("official-model"));
+    let restored_auth: Value = serde_json::from_str(
+        &fs::read_to_string(auth_path(&codex_dir)).expect("read restored official API-key auth"),
+    )
+    .expect("parse restored official API-key auth");
+    assert_eq!(restored_auth, official_auth);
+
+    let _ = fs::remove_file(snapshot_path);
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
+fn switch_provider_pre_switch_hook_observes_current_without_changing_auth() {
     let codex_dir = temp_codex_dir("switch-provider-persist-current");
     write_text(
         &config_path(&codex_dir),
         r#"model_provider = "custom"
 model = "model-a"
+approval_policy = "never"
 
 [model_providers.custom]
 name = "Provider A"
@@ -1170,6 +1628,9 @@ base_url = "https://a.example.com/v1"
 wire_api = "responses"
 requires_openai_auth = false
 experimental_bearer_token = "sk-a-scoped"
+
+[mcp_servers.docs]
+command = "docs-server"
 "#,
     )
     .expect("write provider A config");
@@ -1186,7 +1647,7 @@ experimental_bearer_token = "sk-a-scoped"
     let result = switch_provider_with_pre_persist(
         ProviderInput {
             config_dir: Some(codex_dir.display().to_string()),
-            _provider_id: Some("provider-b".to_string()),
+            provider_id: Some("provider-b".to_string()),
             provider_name: "Provider B".to_string(),
             base_url: "https://b.example.com/v1".to_string(),
             model: "model-b".to_string(),
@@ -1211,6 +1672,16 @@ experimental_bearer_token = "sk-a-scoped"
         .as_deref()
         .unwrap_or_default()
         .contains("experimental_bearer_token"));
+    assert!(!provider_a
+        .toml_config
+        .as_deref()
+        .unwrap_or_default()
+        .contains("approval_policy"));
+    assert!(!provider_a
+        .toml_config
+        .as_deref()
+        .unwrap_or_default()
+        .contains("mcp_servers"));
     assert_eq!(result.state.model.as_deref(), Some("model-b"));
     assert!(result
         .state
@@ -1220,6 +1691,17 @@ experimental_bearer_token = "sk-a-scoped"
         .state
         .config_text
         .contains("https://a.example.com/v1"));
+    assert!(result
+        .state
+        .config_text
+        .contains("approval_policy = \"never\""));
+    assert!(result.state.config_text.contains("[mcp_servers.docs]"));
+    let live_auth: Value = serde_json::from_str(
+        &fs::read_to_string(auth_path(&codex_dir)).expect("read provider B auth"),
+    )
+    .expect("parse provider B auth");
+    assert_eq!(live_auth["auth_mode"], "chatgpt");
+    assert_eq!(live_auth["tokens"]["access_token"], "official-access-token");
 
     let _ = fs::remove_dir_all(codex_dir);
 }
@@ -1229,7 +1711,7 @@ fn switch_provider_reserved_builtin_ids_still_write_live_custom() {
     let codex_dir = temp_codex_dir("switch-provider-reserved");
     let result = switch_provider_inner(ProviderInput {
         config_dir: Some(codex_dir.display().to_string()),
-        _provider_id: Some("openai".to_string()),
+        provider_id: Some("openai".to_string()),
         provider_name: "OpenAI".to_string(),
         base_url: "https://proxy.example.com/v1".to_string(),
         model: "gpt-5.5".to_string(),
@@ -1244,12 +1726,19 @@ fn switch_provider_reserved_builtin_ids_still_write_live_custom() {
     assert!(config_text.contains("model_provider = \"custom\""));
     assert!(config_text.contains("[model_providers.custom]"));
     assert!(!config_text.contains("[model_providers.openai]"));
+    assert!(config_text.contains("experimental_bearer_token = \"sk-proxy\""));
+    assert!(!auth_path(&codex_dir).exists());
+
+    let official = switch_official_provider_inner(Some(codex_dir.display().to_string()))
+        .expect("enter official login without an existing official account");
+    assert!(official.state.is_official_provider);
+    assert!(!auth_path(&codex_dir).exists());
 
     let _ = fs::remove_dir_all(codex_dir);
 }
 
 #[test]
-fn switch_official_persists_detected_custom_before_overwrite() {
+fn switch_official_pre_switch_hook_observes_custom_before_overwrite() {
     let codex_dir = temp_codex_dir("switch-official-persist-current");
     write_text(
         &config_path(&codex_dir),
@@ -1296,7 +1785,8 @@ requires_openai_auth = true
     assert_eq!(provider_a.provider_name, "Provider A");
     assert_eq!(provider_a.base_url, "https://a.example.com/v1");
     assert_eq!(provider_a.api_key.as_deref(), Some("sk-a-auth"));
-    assert_eq!(result.state.model_provider.as_deref(), Some("openai"));
+    assert_eq!(result.state.model_provider.as_deref(), Some("custom"));
+    assert!(result.state.is_official_provider);
     assert_eq!(result.state.model.as_deref(), Some("official-model"));
     assert!(!result
         .state
@@ -1315,7 +1805,7 @@ requires_openai_auth = true
 }
 
 #[test]
-fn switch_official_rejects_untrusted_live_auth_without_snapshot() {
+fn switch_official_without_snapshot_clears_third_party_auth_for_login() {
     let codex_dir = temp_codex_dir("switch-official-preserve-auth");
     write_text(
         &config_path(&codex_dir),
@@ -1339,28 +1829,47 @@ requires_openai_auth = true
     )
     .expect("write auth");
 
-    let error = switch_official_provider_inner(Some(codex_dir.display().to_string()))
-        .expect_err("untrusted live auth must not become official auth");
-    assert!(error.to_string().contains("没有可信的官方认证快照"));
-
-    let auth_text = fs::read_to_string(auth_path(&codex_dir)).expect("read auth");
-    let auth: Value = serde_json::from_str(&auth_text).expect("parse auth");
-    assert_eq!(
-        auth.get("OPENAI_API_KEY").and_then(Value::as_str),
-        Some("sk-live")
-    );
-    assert_eq!(
-        auth.get("auth_mode").and_then(Value::as_str),
-        Some("apikey")
-    );
+    let result = switch_official_provider_inner(Some(codex_dir.display().to_string()))
+        .expect("switch to a clean official login state");
+    assert_eq!(result.state.model_provider.as_deref(), Some("custom"));
+    assert!(result.state.is_official_provider);
+    assert!(!auth_path(&codex_dir).exists());
     let config_text = fs::read_to_string(config_path(&codex_dir)).expect("read config");
     assert!(config_text.contains("model_provider = \"custom\""));
+    assert!(!config_text.contains("base_url"));
 
     let _ = fs::remove_dir_all(codex_dir);
 }
 
 #[test]
-fn switch_official_does_not_trust_api_key_only_official_history() {
+fn switch_official_keeps_api_key_auth_when_live_route_is_already_official() {
+    let codex_dir = temp_codex_dir("switch-official-keep-official-api-key");
+    write_text(
+        &config_path(&codex_dir),
+        "model_provider = \"openai\"\nmodel = \"gpt-5.5\"\n",
+    )
+    .expect("write official config");
+    let official_auth = json!({
+        "OPENAI_API_KEY": "sk-official-api-key",
+        "auth_mode": "apikey"
+    });
+    write_json(&auth_path(&codex_dir), &official_auth).expect("write official API-key auth");
+
+    let result = switch_official_provider_inner(Some(codex_dir.display().to_string()))
+        .expect("refresh already-official route");
+
+    assert!(result.state.is_official_provider);
+    let retained: Value = serde_json::from_str(
+        &fs::read_to_string(auth_path(&codex_dir)).expect("read retained auth"),
+    )
+    .expect("parse retained auth");
+    assert_eq!(retained, official_auth);
+
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
+fn switch_official_ignores_api_key_only_official_history() {
     let codex_dir = temp_codex_dir("switch-official-reject-polluted-history");
     write_text(
         &config_path(&codex_dir),
@@ -1388,11 +1897,13 @@ requires_openai_auth = true
     )
     .expect("write custom config");
 
-    let error = switch_official_provider_inner(Some(codex_dir.display().to_string()))
-        .expect_err("polluted history must not be restored");
-    assert!(error.to_string().contains("没有可信的官方认证快照"));
+    let result = switch_official_provider_inner(Some(codex_dir.display().to_string()))
+        .expect("switch without restoring polluted auth");
+    assert_eq!(result.state.model_provider.as_deref(), Some("custom"));
+    assert!(result.state.is_official_provider);
+    assert!(!auth_path(&codex_dir).exists());
     assert!(fs::read_to_string(config_path(&codex_dir))
-        .expect("read unchanged config")
+        .expect("read official config")
         .contains("model_provider = \"custom\""));
 
     let _ = fs::remove_dir_all(codex_dir);
@@ -1417,7 +1928,7 @@ fn switch_provider_snapshot_restores_auth_after_external_cc_overwrite() {
 
     switch_provider_inner(ProviderInput {
         config_dir: Some(codex_dir.display().to_string()),
-        _provider_id: Some("proxy".to_string()),
+        provider_id: Some("proxy".to_string()),
         provider_name: "Proxy".to_string(),
         base_url: "https://proxy.example.com/v1".to_string(),
         model: "proxy-model".to_string(),
@@ -1438,7 +1949,8 @@ fn switch_provider_snapshot_restores_auth_after_external_cc_overwrite() {
 
     let result = switch_official_provider_inner(Some(codex_dir.display().to_string()))
         .expect("restore official snapshot");
-    assert_eq!(result.state.model_provider.as_deref(), Some("openai"));
+    assert_eq!(result.state.model_provider.as_deref(), Some("custom"));
+    assert!(result.state.is_official_provider);
     assert_eq!(result.state.model.as_deref(), Some("official-model"));
     let restored: Value = serde_json::from_str(
         &fs::read_to_string(auth_path(&codex_dir)).expect("read restored auth"),
@@ -1490,7 +2002,8 @@ requires_openai_auth = true
     let switched = switch_official_provider_inner(Some(codex_dir.display().to_string()))
         .expect("switch to saved official config");
     assert_eq!(switched.state.model.as_deref(), Some("official-model"));
-    assert_eq!(switched.state.model_provider.as_deref(), Some("openai"));
+    assert_eq!(switched.state.model_provider.as_deref(), Some("custom"));
+    assert!(switched.state.is_official_provider);
     let restored: Value = serde_json::from_str(
         &fs::read_to_string(auth_path(&codex_dir)).expect("read official auth"),
     )
@@ -1539,6 +2052,68 @@ experimental_bearer_token = "sk-proxy"
     assert_eq!(state["authExists"].as_bool(), Some(false));
     assert_eq!(state["officialAuthAvailable"].as_bool(), Some(true));
 
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
+fn state_reports_live_chatgpt_auth_while_a_third_party_provider_is_active() {
+    let codex_dir = temp_codex_dir("state-third-party-with-official-auth");
+    write_text(
+        &config_path(&codex_dir),
+        r#"model_provider = "custom"
+model = "proxy-model"
+
+[model_providers.custom]
+name = "Proxy"
+base_url = "https://proxy.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "sk-proxy"
+"#,
+    )
+    .expect("write provider config");
+    write_json(
+        &auth_path(&codex_dir),
+        &json!({
+            "auth_mode": "chatgpt",
+            "tokens": {"access_token": "official-access-token"}
+        }),
+    )
+    .expect("write official auth");
+
+    let state = build_state(codex_dir.clone()).expect("build state");
+    let state = serde_json::to_value(state).expect("serialize state");
+    assert_eq!(state["authExists"].as_bool(), Some(true));
+    assert_eq!(state["officialAuthAvailable"].as_bool(), Some(true));
+    assert_eq!(state["isOfficialProvider"].as_bool(), Some(false));
+
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
+fn state_refresh_propagates_official_snapshot_write_failure() {
+    let codex_dir = temp_codex_dir("state-snapshot-write-failure");
+    write_text(&config_path(&codex_dir), "model = \"gpt-5.5\"\n").expect("write config");
+    write_json(
+        &auth_path(&codex_dir),
+        &json!({
+            "auth_mode": "chatgpt",
+            "tokens": {"access_token": "official-access"}
+        }),
+    )
+    .expect("write official auth");
+    let snapshot = official_snapshot_path_for_test(&codex_dir).expect("resolve snapshot path");
+    if let Some(parent) = snapshot.parent() {
+        fs::create_dir_all(parent).expect("create snapshot parent");
+    }
+    let _ = fs::remove_file(&snapshot);
+    fs::create_dir(&snapshot).expect("occupy snapshot path with directory");
+
+    let error = get_codex_state_inner(Some(codex_dir.display().to_string()))
+        .expect_err("snapshot write failure must reach state caller");
+
+    assert!(error.to_string().contains(&snapshot.display().to_string()));
+    fs::remove_dir(&snapshot).expect("remove occupied snapshot path");
     let _ = fs::remove_dir_all(codex_dir);
 }
 
@@ -1631,10 +2206,15 @@ requires_openai_auth = true
     )
     .expect("reset official config");
 
-    assert_eq!(result.state.model_provider.as_deref(), Some("openai"));
+    assert_eq!(result.state.model_provider.as_deref(), Some("custom"));
+    assert!(result.state.is_official_provider);
     assert_eq!(result.state.model.as_deref(), Some("official-model"));
     assert!(!auth_path(&codex_dir).exists());
-    assert!(!result.state.config_text.contains("model_providers.custom"));
+    assert!(result
+        .state
+        .config_text
+        .contains("[model_providers.custom]"));
+    assert!(!result.state.config_text.contains("base_url"));
     assert!(providers::official_snapshot_path_for_test(&codex_dir)
         .expect("snapshot path")
         .is_file());
@@ -1776,15 +2356,13 @@ requires_openai_auth = true
 }
 
 #[test]
-fn save_provider_toml_config_writes_provider_scoped_bearer_token() {
+fn save_provider_toml_config_scopes_key_without_overwriting_official_auth() {
     let codex_dir = temp_codex_dir("save-provider-toml-token");
     let official_auth = json!({
         "auth_mode": "chatgpt",
         "tokens": {"access_token": "official-access-token"}
     });
     write_json(&auth_path(&codex_dir), &official_auth).expect("write official auth");
-    let auth_before = fs::read(auth_path(&codex_dir)).expect("read auth before save");
-
     let result = save_provider_toml_config_inner(ProviderTomlInput {
         config_dir: Some(codex_dir.display().to_string()),
         config_text: r#"model_provider = "proxy"
@@ -1803,16 +2381,120 @@ requires_openai_auth = false
 
     assert!(result.ok);
     let config_text = fs::read_to_string(config_path(&codex_dir)).expect("read config");
-    assert!(config_text.contains("[model_providers.proxy]"));
+    assert!(config_text.contains("model_provider = \"custom\""));
+    assert!(config_text.contains("[model_providers.custom]"));
+    assert!(!config_text.contains("[model_providers.proxy]"));
     assert!(config_text.contains("experimental_bearer_token = \"sk-provider-table\""));
-    let auth_after = fs::read(auth_path(&codex_dir)).expect("read auth after save");
-    assert_eq!(auth_after, auth_before);
+    let auth_after: Value = serde_json::from_str(
+        &fs::read_to_string(auth_path(&codex_dir)).expect("read auth after save"),
+    )
+    .expect("parse auth after save");
+    assert_eq!(auth_after, official_auth);
 
     let _ = fs::remove_dir_all(codex_dir);
 }
 
 #[test]
-fn save_provider_toml_persists_detected_custom_before_overwrite() {
+fn provider_toml_activation_preserves_unrelated_live_settings() {
+    let codex_dir = temp_codex_dir("provider-toml-merge");
+    let current = r#"# keep-user-comment
+model_provider = "custom"
+model = "old-model"
+approval_policy = "never"
+model_instructions_file = "/tmp/user-prompt.md"
+
+[model_providers.custom]
+name = "Old provider"
+base_url = "https://old.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = false
+
+[mcp_servers.docs]
+command = "docs-server"
+
+[projects."/tmp/work"]
+trust_level = "trusted"
+"#;
+    write_text(&config_path(&codex_dir), current).expect("write current config");
+
+    save_provider_toml_config_inner(ProviderTomlInput {
+        config_dir: Some(codex_dir.display().to_string()),
+        config_text: r#"model_provider = "proxy"
+model = "new-model"
+approval_policy = "on-request"
+
+[model_providers.proxy]
+name = "New provider"
+base_url = "https://new.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = false
+
+[mcp_servers.stale]
+command = "must-not-replace-live"
+"#
+        .to_string(),
+        api_key: Some("sk-new".to_string()),
+    })
+    .expect("merge provider config");
+
+    let merged = fs::read_to_string(config_path(&codex_dir)).expect("read merged config");
+    let doc = merged
+        .parse::<DocumentMut>()
+        .expect("merged config stays valid");
+    assert!(merged.contains("# keep-user-comment"));
+    assert_eq!(doc["model"].as_str(), Some("new-model"));
+    assert_eq!(doc["approval_policy"].as_str(), Some("never"));
+    assert_eq!(
+        doc["model_instructions_file"].as_str(),
+        Some("/tmp/user-prompt.md")
+    );
+    assert_eq!(
+        doc["mcp_servers"]["docs"]["command"].as_str(),
+        Some("docs-server")
+    );
+    assert!(doc["mcp_servers"].get("stale").is_none());
+    assert_eq!(
+        doc["projects"]["/tmp/work"]["trust_level"].as_str(),
+        Some("trusted")
+    );
+    assert_eq!(
+        doc["model_providers"]["custom"]["base_url"].as_str(),
+        Some("https://new.example.com/v1")
+    );
+
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
+fn save_provider_toml_uses_existing_scoped_token_without_creating_auth() {
+    let codex_dir = temp_codex_dir("save-provider-toml-existing-token");
+    let result = save_provider_toml_config_inner(ProviderTomlInput {
+        config_dir: Some(codex_dir.display().to_string()),
+        config_text: r#"model_provider = "custom"
+model = "gpt-5.5"
+
+[model_providers.custom]
+name = "Proxy"
+base_url = "https://proxy.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
+experimental_bearer_token = "sk-existing"
+"#
+        .to_string(),
+        api_key: None,
+    })
+    .expect("save provider toml using existing token");
+
+    assert!(result.ok);
+    assert!(!auth_path(&codex_dir).exists());
+    let config = fs::read_to_string(config_path(&codex_dir)).expect("read live config");
+    assert!(config.contains("experimental_bearer_token = \"sk-existing\""));
+
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
+fn save_provider_toml_pre_switch_hook_observes_current_provider() {
     let codex_dir = temp_codex_dir("save-provider-toml-persist-current");
     write_text(
         &config_path(&codex_dir),
@@ -1954,6 +2636,11 @@ fn thread_provider(path: &Path, id: &str) -> String {
 #[test]
 fn provider_sync_rewrites_every_session_meta_and_preserves_item_ids() {
     let codex_dir = temp_codex_dir("target-provider-all-meta");
+    write_text(
+        &codex_dir.join("config.toml"),
+        "model_provider = \"custom\"\n",
+    )
+    .expect("write shared provider config");
     let database = codex_dir.join("state_5.sqlite");
     let thread_id = "019f6000-0000-7000-8000-000000000101";
     let child_id = "019f6000-0000-7000-8000-000000000102";
@@ -2023,6 +2710,11 @@ fn provider_sync_rewrites_every_session_meta_and_preserves_item_ids() {
 #[test]
 fn user_event_flag_does_not_make_sessions_need_provider_sync() {
     let codex_dir = temp_codex_dir("user-event-flag-is-derived");
+    write_text(
+        &codex_dir.join("config.toml"),
+        "model_provider = \"custom\"\n",
+    )
+    .expect("write shared provider config");
     let parent_id = "019f6000-0000-7000-8000-000000000109";
     let child_id = "019f6000-0000-7000-8000-000000000110";
     let parent_rollout = codex_dir.join("sessions/rollout-parent-user-event.jsonl");
@@ -2081,8 +2773,13 @@ fn user_event_flag_does_not_make_sessions_need_provider_sync() {
 }
 
 #[test]
-fn provider_sync_updates_provider_and_cwd_without_touching_user_flag() {
+fn provider_sync_updates_only_active_provider_without_touching_cwd_or_user_flag() {
     let codex_dir = temp_codex_dir("target-provider-all-dbs");
+    write_text(
+        &codex_dir.join("config.toml"),
+        "model_provider = \"custom\"\n",
+    )
+    .expect("write shared provider config");
     let thread_id = "019f6000-0000-7000-8000-000000000111";
     let rollout = codex_dir.join("sessions/rollout-metadata.jsonl");
     write_rollout_fixture(
@@ -2119,10 +2816,10 @@ fn provider_sync_updates_provider_and_cwd_without_touching_user_flag() {
         Some(codex_dir.display().to_string()),
         Some("custom".to_string()),
     )
-    .expect("sync all databases");
+    .expect("sync active database");
     assert_eq!(result.updated_rollouts, 1);
-    assert_eq!(result.updated_threads, 4);
-    for database in &databases {
+    assert_eq!(result.updated_threads, 1);
+    for (index, database) in databases.iter().enumerate() {
         let repaired = Connection::open(database)
             .expect("open repaired sqlite")
             .query_row(
@@ -2137,9 +2834,10 @@ fn provider_sync_updates_provider_and_cwd_without_touching_user_flag() {
                 },
             )
             .expect("read repaired metadata");
+        let expected_provider = if index == 0 { "openai" } else { "custom" };
         assert_eq!(
             repaired,
-            ("custom".to_string(), 0, "/tmp/project".to_string())
+            (expected_provider.to_string(), 0, "/tmp/wrong".to_string())
         );
     }
 
@@ -2197,6 +2895,11 @@ fn rollback_refuses_to_overwrite_a_file_changed_after_apply() {
 #[test]
 fn provider_sync_restores_jsonl_when_sqlite_update_fails() {
     let codex_dir = temp_codex_dir("target-provider-rollback");
+    write_text(
+        &codex_dir.join("config.toml"),
+        "model_provider = \"custom\"\n",
+    )
+    .expect("write shared provider config");
     let database = codex_dir.join("state_5.sqlite");
     let thread_id = "019f6000-0000-7000-8000-000000000121";
     let rollout = codex_dir.join("sessions/rollout-rollback.jsonl");

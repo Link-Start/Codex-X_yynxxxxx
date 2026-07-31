@@ -83,6 +83,7 @@ export type CodexState = {
   officialAuthAvailable: boolean;
   model?: string;
   modelProvider?: string;
+  isOfficialProvider: boolean;
   instructionFile?: string;
   instructionEnabled: boolean;
   instructionInjectionMode?: PromptInjectionMode;

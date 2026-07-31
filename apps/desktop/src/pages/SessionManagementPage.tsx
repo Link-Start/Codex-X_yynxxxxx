@@ -41,7 +41,10 @@ export type SessionSyncStatus = {
   topLevelThreads: number;
   subagentThreads: number;
   mismatchedThreads: number;
+  mismatchedSessions: number;
   needsSync: boolean;
+  scanComplete: boolean;
+  scanFailures: string[];
   backupDir?: string | null;
   warnings: string[];
   sessions: SessionPreview[];
@@ -153,13 +156,14 @@ export function SessionManagementPage({
     ? {
         syncEyebrow: "会话同步",
         title: "会话管理",
-        description: "检查本地会话是否跟当前供应商一致，需要时一键同步。不会修改聊天内容。",
+        description: "检查本地会话是否位于官方与中转共用的会话列表，需要时一键同步。不会修改聊天内容。",
         syncTo: "同步到",
         check: "检查会话",
         checking: "检查中...",
         sync: "同步会话",
         syncing: "同步中...",
         clickToCheck: "点击检查会话",
+        scanIncomplete: "无法确认同步状态，请查看下方原因",
         needsSync: (count: number) => `有 ${count} 条会话需要同步`,
         allSynced: "全部会话已同步",
         sessionCount: (count: number) => `${count} 条会话`,
@@ -201,13 +205,14 @@ export function SessionManagementPage({
     : {
         syncEyebrow: "SESSION SYNC",
         title: "Session management",
-        description: "Check whether local sessions match the current provider and sync them when needed. Chat content is not changed.",
+        description: "Keep local sessions in one history shared by official and third-party providers. Chat content is not changed.",
         syncTo: "Sync to",
         check: "Check sessions",
         checking: "Checking...",
         sync: "Sync sessions",
         syncing: "Syncing...",
         clickToCheck: "Check sessions to get started",
+        scanIncomplete: "Unable to verify sync status. See the reason below.",
         needsSync: (count: number) => `${count} session(s) need syncing`,
         allSynced: "All sessions are synced",
         sessionCount: (count: number) => `${count} sessions`,
@@ -247,6 +252,11 @@ export function SessionManagementPage({
         confirmDelete: (count: number) => `Delete ${count} permanently`,
       };
 
+  const scanIncomplete = Boolean(sessionStatus && !sessionStatus.scanComplete);
+  const diagnostics = [
+    ...(sessionStatus?.scanFailures || []).map((message) => ({ message, blocking: true })),
+    ...(sessionStatus?.warnings || []).map((message) => ({ message, blocking: false })),
+  ];
   const dialogOpen = sessionDeleteConfirmOpen && selectedSessions.length > 0;
   const selectedVisibleCount = filteredSessions.filter((item) => selectedSessionSet.has(item.id)).length;
   const allVisibleSelected = filteredSessions.length > 0 && selectedVisibleCount === filteredSessions.length;
@@ -327,17 +337,17 @@ export function SessionManagementPage({
               {actionBusy === "checkSessions" ? <Loader2 size={16} className="cx-session-spin" aria-hidden="true" /> : <RefreshCw size={16} aria-hidden="true" />}
               {actionBusy === "checkSessions" ? copy.checking : copy.check}
             </button>
-            <button type="button" className="cx-session-button cx-session-button--primary" onClick={onSyncSessions} disabled={loading || !sessionHasMismatches} aria-busy={actionBusy === "syncSessions"}>
+            <button type="button" className="cx-session-button cx-session-button--primary" onClick={onSyncSessions} disabled={loading || scanIncomplete || !sessionHasMismatches} aria-busy={actionBusy === "syncSessions"}>
               {actionBusy === "syncSessions" ? <Loader2 size={16} className="cx-session-spin" aria-hidden="true" /> : <Zap size={16} aria-hidden="true" />}
               {actionBusy === "syncSessions" ? copy.syncing : copy.sync}
             </button>
           </div>
         </header>
 
-        <div className={cx("cx-session-summary", sessionHasMismatches ? "cx-session-summary--needs-sync" : "cx-session-summary--synced")}>
+        <div className={cx("cx-session-summary", scanIncomplete || sessionHasMismatches ? "cx-session-summary--needs-sync" : "cx-session-summary--synced")}>
           <span className="cx-session-summary-status">
-            {!sessionStatus ? <Info size={15} aria-hidden="true" /> : sessionHasMismatches ? <AlertCircle size={15} aria-hidden="true" /> : <CheckCircle2 size={15} aria-hidden="true" />}
-            {!sessionStatus ? copy.clickToCheck : sessionHasMismatches ? copy.needsSync(sessionSyncCount) : copy.allSynced}
+            {!sessionStatus ? <Info size={15} aria-hidden="true" /> : scanIncomplete || sessionHasMismatches ? <AlertCircle size={15} aria-hidden="true" /> : <CheckCircle2 size={15} aria-hidden="true" />}
+            {!sessionStatus ? copy.clickToCheck : scanIncomplete ? copy.scanIncomplete : sessionHasMismatches ? copy.needsSync(sessionSyncCount) : copy.allSynced}
           </span>
           <span className="cx-session-summary-count">{copy.sessionCount(sessionStatus?.topLevelThreads ?? 0)}</span>
         </div>
@@ -475,15 +485,15 @@ export function SessionManagementPage({
           )}
         </div>
 
-        {sessionStatus?.warnings?.length ? (
-          <details className="cx-session-diagnostics">
+        {diagnostics.length ? (
+          <details className="cx-session-diagnostics" open={scanIncomplete || undefined}>
             <summary>
               <AlertCircle size={15} strokeWidth={1.9} aria-hidden="true" />
               <span>{copy.diagnostics}</span>
-              <small>{copy.diagnosticsCount(sessionStatus.warnings.length)}</small>
+              <small>{copy.diagnosticsCount(diagnostics.length)}</small>
             </summary>
             <div className="cx-session-diagnostic-items">
-              {sessionStatus.warnings.map((item, index) => <p key={`${index}-${item}`}><Info size={14} aria-hidden="true" />{item}</p>)}
+              {diagnostics.map((item, index) => <p key={`${index}-${item.message}`}>{item.blocking ? <AlertCircle size={14} aria-hidden="true" /> : <Info size={14} aria-hidden="true" />}{item.message}</p>)}
             </div>
           </details>
         ) : null}

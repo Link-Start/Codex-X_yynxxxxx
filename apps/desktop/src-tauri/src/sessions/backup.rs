@@ -200,17 +200,6 @@ pub(super) fn create_provider_sync_backup(
             existed: path.exists(),
         });
     }
-    for name in [
-        "config.toml",
-        ".codex-global-state.json",
-        ".codex-global-state.json.bak",
-    ] {
-        snapshots.push(copy_file_to_backup(
-            codex_dir,
-            &backup_dir,
-            &codex_dir.join(name),
-        )?);
-    }
     for path in changed_rollouts {
         snapshots.push(copy_file_to_backup(codex_dir, &backup_dir, path)?);
     }

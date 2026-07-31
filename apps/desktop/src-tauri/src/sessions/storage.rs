@@ -1,4 +1,4 @@
-use super::global_state::{normalize_workspace_path, projectless_thread_ids};
+use super::global_state::normalize_workspace_path;
 use super::types::{RolloutScan, SessionFileChange, SessionPreview, SqliteScan};
 use crate::error::{CodexxError, Result};
 use crate::file_io::{
@@ -9,7 +9,7 @@ use crate::sqlite_utils::{sql_select_column, sqlite_has_table, table_column_set}
 use crate::{config_path, string_value};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -35,26 +35,130 @@ fn is_rollout_file(path: &Path) -> bool {
         .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
 }
 
-fn collect_rollout_paths(root: &Path, out: &mut Vec<PathBuf>, warnings: &mut Vec<String>) {
-    let Ok(entries) = fs::read_dir(root) else {
-        if root.exists() {
-            warnings.push(format!("无法读取目录: {}", root.display()));
+pub(super) fn rollout_filename_matches_id(path: &Path, id: &str) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.ends_with(&format!("-{id}.jsonl")) || name.ends_with(&format!("-{id}.jsonl.zst"))
+        })
+}
+
+pub(super) fn canonical_rollout_storage_roots(codex_dir: &Path) -> Vec<PathBuf> {
+    [
+        codex_dir.join("sessions"),
+        codex_dir.join("archived_sessions"),
+    ]
+    .into_iter()
+    .filter_map(|root| root.canonicalize().ok())
+    .collect()
+}
+
+pub(super) fn is_canonical_rollout_storage_path(codex_dir: &Path, path: &Path) -> bool {
+    canonical_rollout_storage_roots(codex_dir)
+        .iter()
+        .any(|root| path.starts_with(root))
+}
+
+fn referenced_rollout_paths(
+    codex_dir: &Path,
+    rollout_paths_by_thread_id: &HashMap<String, String>,
+    failures: &mut Vec<String>,
+) -> HashMap<PathBuf, HashSet<String>> {
+    let mut referenced = HashMap::<PathBuf, HashSet<String>>::new();
+    for (thread_id, value) in rollout_paths_by_thread_id {
+        let raw = PathBuf::from(value.trim());
+        let path = if raw.is_absolute() {
+            raw
+        } else {
+            codex_dir.join(raw)
+        };
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                failures.push(format!(
+                    "活动 SQLite 引用的会话文件不存在: {}",
+                    path.display()
+                ));
+                continue;
+            }
+            Err(error) => {
+                failures.push(format!(
+                    "无法检查活动会话文件: {} ({error})",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() || !is_rollout_file(&path) {
+            failures.push(format!(
+                "活动 SQLite 引用了不受支持的会话文件: {}",
+                path.display()
+            ));
+            continue;
         }
-        return;
+        let canonical = match path.canonicalize() {
+            Ok(canonical) => canonical,
+            Err(error) => {
+                failures.push(format!(
+                    "无法解析活动会话文件路径: {} ({error})",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        if !is_canonical_rollout_storage_path(codex_dir, &canonical) {
+            failures.push(format!(
+                "活动 SQLite 引用的会话文件超出 Codex 会话目录: {}",
+                path.display()
+            ));
+            continue;
+        }
+        let expected_thread_ids = referenced.entry(canonical.clone()).or_default();
+        expected_thread_ids.insert(thread_id.clone());
+        if expected_thread_ids.len() > 1 {
+            failures.push(format!(
+                "活动 SQLite 的多个线程引用了同一个会话文件: {}",
+                canonical.display()
+            ));
+        }
+    }
+    referenced
+}
+
+fn collect_rollout_paths(root: &Path, out: &mut Vec<PathBuf>, failures: &mut Vec<String>) {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                failures.push(format!("无法读取会话目录: {} ({error})", root.display()));
+            }
+            return;
+        }
     };
     for entry in entries {
-        let Ok(entry) = entry else {
-            continue;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                failures.push(format!("无法读取会话目录项: {} ({error})", root.display()));
+                continue;
+            }
         };
         let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                failures.push(format!(
+                    "无法读取会话文件类型: {} ({error})",
+                    path.display()
+                ));
+                continue;
+            }
         };
         if file_type.is_symlink() {
             continue;
         }
         if file_type.is_dir() {
-            collect_rollout_paths(&path, out, warnings);
+            collect_rollout_paths(&path, out, failures);
         } else if file_type.is_file() && is_rollout_file(&path) {
             out.push(path);
         }
@@ -77,27 +181,87 @@ fn is_locked_io_error(error: &std::io::Error) -> bool {
 }
 
 pub(crate) fn scan_rollouts(codex_dir: &Path, target_provider: &str) -> Result<RolloutScan> {
+    scan_rollouts_with_thread_filter(codex_dir, target_provider, None, None)
+}
+
+pub(super) fn scan_rollouts_for_thread_ids(
+    codex_dir: &Path,
+    target_provider: &str,
+    thread_ids: &HashSet<String>,
+    rollout_paths_by_thread_id: &HashMap<String, String>,
+) -> Result<RolloutScan> {
+    scan_rollouts_with_thread_filter(
+        codex_dir,
+        target_provider,
+        Some(thread_ids),
+        Some(rollout_paths_by_thread_id),
+    )
+}
+
+fn scan_rollouts_with_thread_filter(
+    codex_dir: &Path,
+    target_provider: &str,
+    allowed_thread_ids: Option<&HashSet<String>>,
+    rollout_paths_by_thread_id: Option<&HashMap<String, String>>,
+) -> Result<RolloutScan> {
     let mut paths = Vec::new();
     let mut scan = RolloutScan::default();
+    let mut referenced = HashMap::new();
     for dir in ["sessions", "archived_sessions"] {
-        collect_rollout_paths(&codex_dir.join(dir), &mut paths, &mut scan.warnings);
+        collect_rollout_paths(&codex_dir.join(dir), &mut paths, &mut scan.scan_failures);
     }
     paths.sort();
+    scan.discovered_rollout_files = paths.len();
+    if let Some(allowed_thread_ids) = allowed_thread_ids {
+        let empty_rollout_paths = HashMap::new();
+        let rollout_paths_by_thread_id = rollout_paths_by_thread_id.unwrap_or(&empty_rollout_paths);
+        let explicitly_referenced_thread_ids = rollout_paths_by_thread_id
+            .keys()
+            .filter(|id| allowed_thread_ids.contains(*id))
+            .cloned()
+            .collect::<HashSet<_>>();
+        referenced = referenced_rollout_paths(
+            codex_dir,
+            rollout_paths_by_thread_id,
+            &mut scan.scan_failures,
+        );
+        paths.retain(|path| {
+            let is_unreferenced_thread_rollout = allowed_thread_ids
+                .iter()
+                .filter(|id| !explicitly_referenced_thread_ids.contains(*id))
+                .any(|id| rollout_filename_matches_id(path, id));
+            is_unreferenced_thread_rollout
+                || path
+                    .canonicalize()
+                    .is_ok_and(|canonical| referenced.contains_key(&canonical))
+        });
+    }
     scan.rollout_files = paths.len();
 
     for path in paths {
+        let expected_thread_ids = path
+            .canonicalize()
+            .ok()
+            .and_then(|canonical| referenced.get(&canonical));
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
-            Err(error) if is_locked_io_error(&error) => {
-                scan.warnings
-                    .push(format!("跳过被占用/无权限会话文件: {}", path.display()));
+            Err(error) => {
+                let reason = if is_locked_io_error(&error) {
+                    "会话文件被占用或无权限读取"
+                } else {
+                    "无法读取会话文件"
+                };
+                scan.scan_failures
+                    .push(format!("{reason}: {} ({error})", path.display()));
                 continue;
             }
-            Err(error) => return Err(io_err(&path, error)),
         };
         let mut next_text = String::with_capacity(text.len());
         let mut rewrite_needed = false;
         let mut file_session_meta_count = 0usize;
+        let mut file_mismatched_session_meta = 0usize;
+        let mut invalid_json_lines = 0usize;
+        let mut invalid_session_meta = 0usize;
         let mut thread_id = None;
         let mut cwd = None;
 
@@ -111,7 +275,6 @@ pub(crate) fn scan_rollouts(codex_dir: &Path, target_provider: &str) -> Result<R
                             record.get_mut("payload").and_then(Value::as_object_mut)
                         {
                             file_session_meta_count += 1;
-                            scan.session_meta_count += 1;
                             if thread_id.is_none() {
                                 thread_id = payload
                                     .get("id")
@@ -134,26 +297,69 @@ pub(crate) fn scan_rollouts(codex_dir: &Path, target_provider: &str) -> Result<R
                                 next_line = serde_json::to_string(&record)
                                     .map_err(|error| json_err(&path, error))?;
                                 rewrite_needed = true;
-                                scan.mismatched_session_meta += 1;
+                                file_mismatched_session_meta += 1;
                             }
+                        } else {
+                            invalid_session_meta += 1;
                         }
                     }
+                } else {
+                    invalid_json_lines += 1;
                 }
             }
             next_text.push_str(&next_line);
             next_text.push_str(line_ending);
         }
 
+        if invalid_json_lines > 0 {
+            scan.scan_failures.push(format!(
+                "会话文件包含 {invalid_json_lines} 行无法解析的 JSON: {}",
+                path.display()
+            ));
+        }
+        if invalid_session_meta > 0 {
+            scan.scan_failures.push(format!(
+                "会话文件包含 {invalid_session_meta} 条无法读取的 session_meta: {}",
+                path.display()
+            ));
+        }
+
         if file_session_meta_count == 0 {
+            if expected_thread_ids.is_some() {
+                scan.scan_failures.push(format!(
+                    "活动 SQLite 引用的会话文件缺少 session_meta: {}",
+                    path.display()
+                ));
+            }
             continue;
         }
-        if let Some(thread_id) = thread_id {
-            if let Some(cwd) = cwd {
-                scan.cwd_by_thread_id.insert(thread_id, cwd);
+        let Some(thread_id) = thread_id else {
+            scan.scan_failures.push(format!(
+                "会话文件的 session_meta 缺少 id: {}",
+                path.display()
+            ));
+            continue;
+        };
+        if let Some(expected_thread_ids) = expected_thread_ids {
+            if expected_thread_ids.len() != 1 || !expected_thread_ids.contains(&thread_id) {
+                scan.scan_failures.push(format!(
+                    "活动 SQLite 引用的会话文件与线程 ID 不一致: {}",
+                    path.display()
+                ));
+                continue;
             }
+        }
+        if allowed_thread_ids.is_some_and(|allowed| !allowed.contains(&thread_id)) {
+            continue;
+        }
+        scan.session_meta_count += file_session_meta_count;
+        if let Some(cwd) = cwd {
+            scan.cwd_by_thread_id.insert(thread_id.clone(), cwd);
         }
         if rewrite_needed {
             scan.mismatched_rollouts += 1;
+            scan.mismatched_session_meta += file_mismatched_session_meta;
+            scan.mismatched_thread_ids.insert(thread_id);
             scan.changes.push(SessionFileChange {
                 original_mtime: fs::metadata(&path)
                     .and_then(|metadata| metadata.modified())
@@ -164,9 +370,6 @@ pub(crate) fn scan_rollouts(codex_dir: &Path, target_provider: &str) -> Result<R
             });
         }
     }
-    let projectless = projectless_thread_ids(&codex_dir.join(".codex-global-state.json"))?;
-    scan.cwd_by_thread_id
-        .retain(|thread_id, _| !projectless.contains(thread_id));
     Ok(scan)
 }
 
@@ -307,6 +510,7 @@ fn configured_sqlite_home(codex_dir: &Path) -> Option<PathBuf> {
 #[derive(Debug)]
 struct SqliteStorageRoot {
     path: PathBuf,
+    is_active: bool,
     active_priority: usize,
     session_priority: usize,
     allow_custom_names: bool,
@@ -314,9 +518,11 @@ struct SqliteStorageRoot {
 
 fn sqlite_storage_roots(codex_dir: &Path) -> Vec<SqliteStorageRoot> {
     let mut roots = Vec::new();
-    if let Some(configured) = configured_sqlite_home(codex_dir) {
+    let configured = configured_sqlite_home(codex_dir);
+    if let Some(configured) = configured.as_ref() {
         roots.push(SqliteStorageRoot {
-            path: configured,
+            path: configured.clone(),
+            is_active: true,
             active_priority: 0,
             session_priority: 0,
             allow_custom_names: true,
@@ -324,12 +530,14 @@ fn sqlite_storage_roots(codex_dir: &Path) -> Vec<SqliteStorageRoot> {
     }
     roots.push(SqliteStorageRoot {
         path: codex_dir.to_path_buf(),
+        is_active: configured.is_none(),
         active_priority: 1,
         session_priority: 2,
         allow_custom_names: false,
     });
     roots.push(SqliteStorageRoot {
         path: codex_dir.join("sqlite"),
+        is_active: false,
         active_priority: 2,
         session_priority: 1,
         allow_custom_names: true,
@@ -364,6 +572,7 @@ pub(super) struct SqliteDiscovery {
     pub(super) session_paths: Vec<PathBuf>,
     pub(super) related_paths: Vec<PathBuf>,
     pub(super) unreadable_paths: Vec<PathBuf>,
+    pub(super) active_scan_failures: Vec<String>,
 }
 
 impl SqliteDiscovery {
@@ -379,6 +588,7 @@ impl SqliteDiscovery {
 #[derive(Debug)]
 struct DiscoveredSqlite {
     path: PathBuf,
+    is_active: bool,
     active_priority: usize,
     session_priority: usize,
     state_version: Option<u64>,
@@ -462,6 +672,17 @@ fn primary_paths_first(primary: &[PathBuf], paths: &[PathBuf]) -> Vec<PathBuf> {
     ordered
 }
 
+fn compare_sqlite_filenames(left: &Path, right: &Path) -> std::cmp::Ordering {
+    left.file_name()
+        .is_none_or(|name| name != std::ffi::OsStr::new("codex-dev.db"))
+        .cmp(
+            &right
+                .file_name()
+                .is_none_or(|name| name != std::ffi::OsStr::new("codex-dev.db")),
+        )
+        .then_with(|| left.file_name().cmp(&right.file_name()))
+}
+
 pub(super) fn ensure_sqlite_discovery_writable(discovery: &SqliteDiscovery) -> Result<()> {
     if discovery.unreadable_paths.is_empty() {
         Ok(())
@@ -484,18 +705,7 @@ fn ordered_database_paths(
     matches.sort_by(|left, right| {
         priority(left)
             .cmp(&priority(right))
-            .then_with(|| {
-                left.path
-                    .file_name()
-                    .is_none_or(|name| name != std::ffi::OsStr::new("codex-dev.db"))
-                    .cmp(
-                        &right
-                            .path
-                            .file_name()
-                            .is_none_or(|name| name != std::ffi::OsStr::new("codex-dev.db")),
-                    )
-            })
-            .then_with(|| left.path.file_name().cmp(&right.path.file_name()))
+            .then_with(|| compare_sqlite_filenames(&left.path, &right.path))
     });
     matches
         .into_iter()
@@ -507,20 +717,56 @@ pub(super) fn discover_sqlite_databases(codex_dir: &Path) -> SqliteDiscovery {
     let mut databases = Vec::new();
     let mut seen_paths = HashSet::new();
     let mut unreadable_paths = Vec::new();
+    let mut active_scan_failures = Vec::new();
 
     for root in sqlite_storage_roots(codex_dir) {
-        let Ok(entries) = fs::read_dir(&root.path) else {
-            continue;
+        let entries = match fs::read_dir(&root.path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                if root.is_active && error.kind() != std::io::ErrorKind::NotFound {
+                    active_scan_failures.push(format!(
+                        "无法读取当前会话数据库目录: {} ({error})",
+                        root.path.display()
+                    ));
+                }
+                continue;
+            }
         };
-        let mut paths = entries
-            .flatten()
-            .filter_map(|entry| {
-                let file_type = entry.file_type().ok()?;
-                (file_type.is_file() && !file_type.is_symlink()).then(|| entry.path())
-            })
-            .filter(|path| is_sqlite_file(path))
-            .filter(|path| root.allow_custom_names || is_root_codex_sqlite_file(path))
-            .collect::<Vec<_>>();
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    if root.is_active {
+                        active_scan_failures.push(format!(
+                            "无法读取当前会话数据库目录项: {} ({error})",
+                            root.path.display()
+                        ));
+                    }
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    if root.is_active {
+                        active_scan_failures.push(format!(
+                            "无法读取当前会话数据库文件类型: {} ({error})",
+                            path.display()
+                        ));
+                    }
+                    continue;
+                }
+            };
+            if file_type.is_file()
+                && !file_type.is_symlink()
+                && is_sqlite_file(&path)
+                && (root.allow_custom_names || is_root_codex_sqlite_file(&path))
+            {
+                paths.push(path);
+            }
+        }
         paths.sort();
 
         for path in paths {
@@ -529,7 +775,18 @@ pub(super) fn discover_sqlite_databases(codex_dir: &Path) -> SqliteDiscovery {
             }
             let codex_named = is_root_codex_sqlite_file(&path);
             let Some(tables) = sqlite_table_names(&path) else {
-                if has_sqlite_header(&path) {
+                let header_is_sqlite = has_sqlite_header(&path);
+                let read_error = fs::File::open(&path).err();
+                if header_is_sqlite || read_error.is_some() {
+                    if root.is_active {
+                        let detail = read_error
+                            .map(|error| format!(" ({error})"))
+                            .unwrap_or_default();
+                        active_scan_failures.push(format!(
+                            "无法读取当前活动会话数据库: {}{detail}",
+                            path.display()
+                        ));
+                    }
                     unreadable_paths.push(path);
                 }
                 continue;
@@ -544,6 +801,7 @@ pub(super) fn discover_sqlite_databases(codex_dir: &Path) -> SqliteDiscovery {
             databases.push(DiscoveredSqlite {
                 state_version: sqlite_state_version(&path),
                 path,
+                is_active: root.is_active,
                 active_priority: root.active_priority,
                 session_priority: root.session_priority,
                 has_threads,
@@ -555,12 +813,12 @@ pub(super) fn discover_sqlite_databases(codex_dir: &Path) -> SqliteDiscovery {
 
     let active_path = databases
         .iter()
-        .filter(|database| database.has_threads && database.state_version.is_some())
+        .filter(|database| database.is_active && database.has_threads)
         .min_by(|left, right| {
             left.active_priority
                 .cmp(&right.active_priority)
                 .then_with(|| right.state_version.cmp(&left.state_version))
-                .then_with(|| right.path.file_name().cmp(&left.path.file_name()))
+                .then_with(|| compare_sqlite_filenames(&left.path, &right.path))
         })
         .map(|database| database.path.clone());
 
@@ -582,6 +840,7 @@ pub(super) fn discover_sqlite_databases(codex_dir: &Path) -> SqliteDiscovery {
             |database| database.active_priority,
         ),
         unreadable_paths,
+        active_scan_failures,
     }
 }
 
@@ -720,6 +979,7 @@ pub(super) fn scan_sqlite_with_paths(
 ) -> Result<SqliteScan> {
     let mut scan = SqliteScan::default();
     let mut thread_ids = HashSet::new();
+    let mut rollout_paths_by_thread_id = HashMap::new();
     let mut subagent_ids = HashSet::new();
     let mut mismatched_ids = HashSet::new();
     for path in sqlite_paths {
@@ -729,8 +989,8 @@ pub(super) fn scan_sqlite_with_paths(
         ) {
             Ok(conn) => conn,
             Err(e) => {
-                scan.warnings
-                    .push(format!("无法读取 SQLite: {} ({e})", path.display()));
+                scan.scan_failures
+                    .push(format!("无法读取当前活动 SQLite: {} ({e})", path.display()));
                 continue;
             }
         };
@@ -739,15 +999,17 @@ pub(super) fn scan_sqlite_with_paths(
         }
         let cols = table_column_set(&conn, "threads")?;
         if !cols.contains("id") || !cols.contains("model_provider") {
-            scan.warnings.push(format!(
-                "SQLite threads 缺少 id 或 model_provider 字段: {}",
+            scan.scan_failures.push(format!(
+                "当前活动 SQLite 的 threads 表缺少 id 或 model_provider 字段: {}",
                 path.display()
             ));
             continue;
         }
         scan.sqlite_dbs += 1;
         let cwd_col = sql_select_column(&cols, "cwd", "NULL");
-        let query = format!("SELECT \"id\", \"model_provider\", {cwd_col} FROM threads");
+        let rollout_col = sql_select_column(&cols, "rollout_path", "NULL");
+        let query =
+            format!("SELECT \"id\", \"model_provider\", {cwd_col}, {rollout_col} FROM threads");
         let mut stmt = conn
             .prepare(&query)
             .map_err(|e| CodexxError::Database(e.to_string()))?;
@@ -757,12 +1019,20 @@ pub(super) fn scan_sqlite_with_paths(
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             })
             .map_err(|e| CodexxError::Database(e.to_string()))?;
         for row in rows {
-            let (id, provider, cwd) = row.map_err(|e| CodexxError::Database(e.to_string()))?;
+            let (id, provider, cwd, rollout_path) =
+                row.map_err(|e| CodexxError::Database(e.to_string()))?;
             thread_ids.insert(id.clone());
+            if let Some(rollout_path) = rollout_path
+                .map(|path| path.trim().to_string())
+                .filter(|path| !path.is_empty())
+            {
+                rollout_paths_by_thread_id.insert(id.clone(), rollout_path);
+            }
             if sqlite_thread_needs_alignment(
                 rollouts,
                 target_provider,
@@ -783,6 +1053,9 @@ pub(super) fn scan_sqlite_with_paths(
     scan.subagent_threads = subagent_ids.len();
     scan.top_level_threads = thread_ids.len().saturating_sub(subagent_ids.len());
     scan.mismatched_threads = mismatched_ids.len();
+    scan.thread_ids = thread_ids;
+    scan.rollout_paths_by_thread_id = rollout_paths_by_thread_id;
+    scan.mismatched_thread_ids = mismatched_ids;
     Ok(scan)
 }
 
@@ -887,16 +1160,17 @@ pub(super) fn list_session_previews_with_paths(
                     .as_ref()
                     .map(|v| v.trim().to_string())
                     .filter(|v| !v.is_empty());
-                let needs_sync = sqlite_thread_needs_alignment(
-                    rollouts,
-                    target_provider,
-                    &SqliteThreadIndexState {
-                        thread_id: &id,
-                        provider: normalized_provider.as_deref(),
-                        cwd: normalized_cwd.as_deref(),
-                        cwd_column: cols.contains("cwd"),
-                    },
-                );
+                let needs_sync = rollouts.mismatched_thread_ids.contains(&id)
+                    || sqlite_thread_needs_alignment(
+                        rollouts,
+                        target_provider,
+                        &SqliteThreadIndexState {
+                            thread_id: &id,
+                            provider: normalized_provider.as_deref(),
+                            cwd: normalized_cwd.as_deref(),
+                            cwd_column: cols.contains("cwd"),
+                        },
+                    );
                 let is_subagent = subagent_thread_ids.contains(&id);
                 Ok(SessionPreview {
                     id,
@@ -979,10 +1253,15 @@ mod tests {
     }
 
     #[test]
-    fn root_state_10_is_listed_and_synchronized() {
+    fn root_state_10_uses_shared_bucket_even_when_openai_is_requested() {
         let codex_dir = temp_codex_dir("root-state-10");
         let database = codex_dir.join("state_10.sqlite");
         let id = "019f6000-0000-7000-8000-000000000301";
+        fs::write(
+            codex_dir.join("config.toml"),
+            "model_provider = \"custom\"\n",
+        )
+        .expect("write shared provider config");
         create_thread_database(&database, id, "openai");
 
         let discovery = discover_sqlite_databases(&codex_dir);
@@ -999,11 +1278,20 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, id);
 
+        let status = crate::sessions::sync::session_sync_status_inner(
+            Some(codex_dir.display().to_string()),
+            Some("openai".to_string()),
+        )
+        .expect("read shared bucket status");
+        assert_eq!(status.target_provider, "custom");
+        assert!(status.needs_sync);
+
         let result = crate::sessions::sync::sync_sessions_provider_inner(
             Some(codex_dir.display().to_string()),
-            Some("custom".to_string()),
+            Some("openai".to_string()),
         )
         .expect("sync root state_10");
+        assert_eq!(result.status.target_provider, "custom");
         assert_eq!(result.updated_threads, 1);
         let provider: String = Connection::open(&database)
             .expect("reopen state_10")
@@ -1014,6 +1302,91 @@ mod tests {
             )
             .expect("read updated provider");
         assert_eq!(provider, "custom");
+
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn root_codex_dev_database_is_active_without_state_database() {
+        let codex_dir = temp_codex_dir("root-codex-dev");
+        let database = codex_dir.join("codex-dev.db");
+        create_thread_database(&database, "019f6000-0000-7000-8000-000000000302", "openai");
+
+        let discovery = discover_sqlite_databases(&codex_dir);
+        assert_eq!(discovery.active_paths, vec![database.clone()]);
+        assert_eq!(discovery.thread_paths, vec![database]);
+
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn configured_sqlite_home_custom_database_is_active() {
+        let codex_dir = temp_codex_dir("configured-custom-active");
+        fs::write(
+            codex_dir.join("config.toml"),
+            "sqlite_home = \"session-store\"\n",
+        )
+        .expect("write sqlite_home config");
+        let database = codex_dir.join("session-store/custom-name.db");
+        let later_database = codex_dir.join("session-store/later-name.sqlite3");
+        create_thread_database(&database, "019f6000-0000-7000-8000-000000000303", "openai");
+        create_thread_database(
+            &later_database,
+            "019f6000-0000-7000-8000-000000000304",
+            "openai",
+        );
+
+        let discovery = discover_sqlite_databases(&codex_dir);
+        assert_eq!(discovery.active_paths, vec![database.clone()]);
+        assert_eq!(discovery.thread_paths, vec![database, later_database]);
+
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn configured_sqlite_home_prefers_codex_dev_before_custom_database() {
+        let codex_dir = temp_codex_dir("configured-codex-dev-precedence");
+        fs::write(
+            codex_dir.join("config.toml"),
+            "sqlite_home = \"session-store\"\n",
+        )
+        .expect("write sqlite_home config");
+        let storage = codex_dir.join("session-store");
+        let codex_dev = storage.join("codex-dev.db");
+        let custom = storage.join("custom-name.db");
+        create_thread_database(&codex_dev, "019f6000-0000-7000-8000-000000000305", "openai");
+        create_thread_database(&custom, "019f6000-0000-7000-8000-000000000306", "openai");
+
+        let discovery = discover_sqlite_databases(&codex_dir);
+        assert_eq!(discovery.active_paths, vec![codex_dev]);
+
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn configured_sqlite_home_prefers_latest_state_database() {
+        let codex_dir = temp_codex_dir("configured-state-precedence");
+        fs::write(
+            codex_dir.join("config.toml"),
+            "sqlite_home = \"session-store\"\n",
+        )
+        .expect("write sqlite_home config");
+        let storage = codex_dir.join("session-store");
+        let custom = storage.join("custom-name.db");
+        let codex_dev = storage.join("codex-dev.db");
+        let state_5 = storage.join("state_5.sqlite");
+        let state_10 = storage.join("state_10.sqlite");
+        for (database, id) in [
+            (&custom, "019f6000-0000-7000-8000-000000000307"),
+            (&codex_dev, "019f6000-0000-7000-8000-000000000308"),
+            (&state_5, "019f6000-0000-7000-8000-000000000309"),
+            (&state_10, "019f6000-0000-7000-8000-000000000310"),
+        ] {
+            create_thread_database(database, id, "openai");
+        }
+
+        let discovery = discover_sqlite_databases(&codex_dir);
+        assert_eq!(discovery.active_paths, vec![state_10]);
 
         let _ = fs::remove_dir_all(codex_dir);
     }
@@ -1088,10 +1461,7 @@ mod tests {
     fn unrelated_root_sqlite_is_not_classified_as_codex_storage() {
         let codex_dir = temp_codex_dir("unrelated-root");
         let unrelated = codex_dir.join("unrelated.sqlite");
-        let conn = Connection::open(&unrelated).expect("create unrelated sqlite");
-        conn.execute("CREATE TABLE logs (thread_id TEXT)", [])
-            .expect("create unrelated logs table");
-        drop(conn);
+        create_thread_database(&unrelated, "019f6000-0000-7000-8000-000000000341", "openai");
 
         let discovery = discover_sqlite_databases(&codex_dir);
         assert!(!discovery.related_paths.contains(&unrelated));

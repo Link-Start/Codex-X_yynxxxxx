@@ -365,8 +365,8 @@ function getProviderPageCopy(lang: Lang): ProviderCopy {
       ? `“${providerName}”将从供应商列表中删除，此操作无法撤销。`
       : `“${providerName}” will be removed from the provider list. This cannot be undone.`,
     deleteCurrentDescription: (providerName) => isChinese
-      ? `“${providerName}”当前正在使用。删除后不会自动切换供应商，确定继续吗？`
-      : `“${providerName}” is currently active. Deleting it will not switch providers automatically. Continue?`,
+      ? `“${providerName}”当前正在使用。删除前会先热切换到 OpenAI Official，确定继续吗？`
+      : `“${providerName}” is currently active. Codex-X will hot-switch to OpenAI Official before deleting it. Continue?`,
     deleteCancelLabel: isChinese ? "取消" : "Cancel",
     deleteConfirmLabel: isChinese ? "确认删除" : "Delete",
     noBaseUrlLabel: "no base_url",
@@ -413,8 +413,8 @@ function getProviderPageCopy(lang: Lang): ProviderCopy {
       : "Preview the authentication data. An empty API key keeps the current auth file.",
     tomlTitle: "config.toml (TOML)",
     tomlDescription: isChinese
-      ? "这里保存供应商模板，只有启用供应商时才会写入 Codex 当前配置。"
-      : "This stores the provider template and is written to the live config only when enabled.",
+      ? "上方标准字段是启用时的权威值；已有模板中的其他扩展字段会保留。只有点击“重置生成”才会替换为标准模板。"
+      : "The standard fields above are authoritative when enabled. Other fields from an existing template are preserved; only Reset replaces it with the standard template.",
     resetTomlLabel: isChinese ? "重置生成" : "Reset",
     saveLabel: t.provider.saveAndSwitch,
     savingLabel: isChinese ? "保存中..." : "Saving...",
@@ -431,7 +431,7 @@ function providerId(name: string) {
 }
 
 function isReservedCodexProviderId(id: string) {
-  return ["openai", "amazon-bedrock", "ollama", "lmstudio", "oss"].includes(id.trim().toLowerCase());
+  return ["openai", "custom", "amazon-bedrock", "ollama", "lmstudio", "oss"].includes(id.trim().toLowerCase());
 }
 
 function customProviderId(name: string) {
@@ -558,79 +558,36 @@ function providerIdentityKey(baseUrl?: string | null, apiKey?: string | null, pr
   ]);
 }
 
-function buildProviderTomlPreview(provider: SavedProvider, state: CodexState | null) {
+function buildProviderTomlPreview(provider: SavedProvider) {
   const model = provider.model.trim() || "gpt-5.5";
   const name = provider.providerName.trim() || "your-provider";
-  // Codex live config follows cc-switch: all third-party providers are applied as `custom`.
   const providerKey = "custom";
   const baseUrl = provider.baseUrl.trim().replace(/\/+$/, "") || "https://example.com/v1";
   const wireApi = provider.wireApi || "responses";
-  const source = state?.configText?.trimEnd() || "";
-  const sourceLines = source ? source.split("\n") : [];
-  const keptLines: string[] = [];
-  let currentSection = "";
-  let skippingCustomProvider = false;
-  let hasReasoningEffort = false;
-
-  for (const line of sourceLines) {
-    const sectionMatch = line.match(/^\s*\[([^\]]+)]\s*$/);
-    if (sectionMatch) {
-      currentSection = sectionMatch[1].trim();
-      skippingCustomProvider = currentSection === `model_providers.${providerKey}`;
-      if (skippingCustomProvider) continue;
-    }
-    if (skippingCustomProvider) continue;
-
-    if (!currentSection) {
-      const keyMatch = line.match(/^\s*([A-Za-z0-9_-]+)\s*=/);
-      const key = keyMatch?.[1];
-      if (key === "model_provider" || key === "model") continue;
-      if (key === "model_reasoning_effort") hasReasoningEffort = true;
-    }
-    keptLines.push(line);
-  }
-
-  const firstSectionIndex = keptLines.findIndex((line) => /^\s*\[[^\]]+]\s*$/.test(line));
-  const rootLines = (firstSectionIndex === -1 ? keptLines : keptLines.slice(0, firstSectionIndex)).filter((line, index, lines) => {
-    if (line.trim()) return true;
-    return index > 0 && index < lines.length - 1;
-  });
-  const sectionLines = firstSectionIndex === -1 ? [] : keptLines.slice(firstSectionIndex).filter((line, index, lines) => {
-    if (line.trim()) return true;
-    return index > 0 && index < lines.length - 1;
-  });
-
-  const headerLines = [
+  return [
     `model_provider = "${tomlEscape(providerKey)}"`,
     `model = "${tomlEscape(model)}"`,
-  ];
-  if (!hasReasoningEffort) {
-    headerLines.push('model_reasoning_effort = "high"');
-  }
-
-  const providerLines = [
+    "",
     `[model_providers.${providerKey}]`,
     `name = "${tomlEscape(name)}"`,
     `base_url = "${tomlEscape(baseUrl)}"`,
     `wire_api = "${tomlEscape(wireApi)}"`,
     `requires_openai_auth = ${provider.requiresOpenaiAuth ? "true" : "false"}`,
-  ];
-
-  return [
-    ...headerLines,
-    ...(rootLines.length ? ["", ...rootLines] : []),
-    "",
-    ...providerLines,
-    ...(sectionLines.length ? ["", ...sectionLines] : []),
   ].join("\n");
 }
-
 
 function buildProviderAuthPreview(provider: SavedProvider) {
   const key = provider.apiKey?.trim();
   return JSON.stringify({ OPENAI_API_KEY: key || null, auth_mode: key ? "apikey" : undefined }, null, 2);
 }
 
+function sessionMismatchCount(status: SessionSyncStatus | null) {
+  if (!status?.needsSync) return 0;
+  const exactCount = Number.isFinite(status.mismatchedSessions)
+    ? status.mismatchedSessions
+    : Math.max(status.mismatchedThreads, status.mismatchedRollouts);
+  return Math.max(1, exactCount);
+}
 
 function instructionIdFromPath(path: string | undefined, templates: InstructionTemplate[]) {
   if (!path) return "";
@@ -759,6 +716,7 @@ function App() {
   );
   const [skillsMcpTab, setSkillsMcpTab] = React.useState<"mcp" | "skills">("mcp");
   const [editingProviderId, setEditingProviderId] = React.useState<string | null>(null);
+  const [editingDetectedProvider, setEditingDetectedProvider] = React.useState(false);
   const [editingPromptId, setEditingPromptId] = React.useState<string | null>(null);
   const [editingBuiltinPrompt, setEditingBuiltinPrompt] = React.useState<BuiltinPromptDetail | null>(null);
   const [savedProviders, setSavedProviders] = React.useState<SavedProvider[]>([]);
@@ -790,7 +748,6 @@ function App() {
   const [error, setError] = React.useState<string>("");
   const [providerForm, setProviderForm] = React.useState<SavedProvider>(defaultProviderForm);
   const [providerTomlDraft, setProviderTomlDraft] = React.useState("");
-  const [providerTomlDirty, setProviderTomlDirty] = React.useState(false);
   const [providerApiKeyVisible, setProviderApiKeyVisible] = React.useState(false);
   const [providerTestingId, setProviderTestingId] = React.useState("");
   const [availableProviderModels, setAvailableProviderModels] = React.useState<ProviderModel[]>([]);
@@ -809,6 +766,7 @@ function App() {
   const providerModelsRequestRef = React.useRef(0);
   const promptModeHelpRef = React.useRef<HTMLDivElement | null>(null);
   const promptRefreshRequestRef = React.useRef(0);
+  const refreshRequestRef = React.useRef(0);
   const promptRefreshInFlightRef = React.useRef<Promise<BuiltinPromptStatus[]> | null>(null);
   const promptAutoRefreshAttemptedRef = React.useRef(false);
   const promptCatalogReadyRef = React.useRef(false);
@@ -840,7 +798,7 @@ function App() {
     setError,
     setToast,
   });
-  const providerTomlPreview = React.useMemo(() => buildProviderTomlPreview(providerForm, state), [providerForm, state]);
+  const providerTomlPreview = React.useMemo(() => buildProviderTomlPreview(providerForm), [providerForm]);
   const providerAuthPreview = React.useMemo(() => buildProviderAuthPreview(providerForm), [providerForm]);
   const activeBuiltinTemplateId = state?.instructionTemplateKey?.startsWith("builtin:")
     ? state.instructionTemplateKey.slice("builtin:".length)
@@ -989,33 +947,21 @@ function App() {
     });
   }, [lang, skinCenterEnabled]);
 
-  React.useEffect(() => {
-    if (providerMode === "form" && !providerTomlDirty) {
-      setProviderTomlDraft(providerTomlPreview);
-    }
-  }, [providerMode, providerTomlDirty, providerTomlPreview]);
-
   const currentProvider = state?.providers.find((p) => p.isCurrent);
   const liveProviderId = (state?.modelProvider || "openai").trim();
-  const liveCustomProvider = React.useMemo(() => (state?.providers || []).find((item) => item.id === "custom"), [state?.providers]);
   const liveProviderApiKey = React.useMemo(() => {
     const configKey = extractTomlProviderApiKey(state?.configText, liveProviderId);
-    const authKey = extractOpenAiApiKey(state?.authText).trim();
-    return configKey || authKey;
-  }, [liveProviderId, state?.authText, state?.configText]);
+    if (!state?.isOfficialProvider) return configKey;
+    return extractOpenAiApiKey(state?.authText).trim();
+  }, [liveProviderId, state?.authText, state?.configText, state?.isOfficialProvider]);
   const inferredActiveProviderId = React.useMemo(() => {
-    if (liveProviderId !== "custom") return "";
-    const liveIdentity = providerIdentityKey(liveCustomProvider?.baseUrl, liveProviderApiKey, liveCustomProvider?.name || liveCustomProvider?.id);
-    if (!liveIdentity) return "";
-    const identityMatches = savedProviders.filter((item) =>
-      providerIdentityKey(item.baseUrl, savedProviderApiKey(item), item.providerName) === liveIdentity,
-    );
-    const remembered = identityMatches.find((item) => item.id === activeProviderId);
-    if (remembered) return remembered.id;
-    const backendMatch = identityMatches.find((item) => item.id === state?.activeSavedProviderId);
-    return backendMatch?.id || identityMatches[0]?.id || "";
-  }, [activeProviderId, liveCustomProvider?.baseUrl, liveCustomProvider?.id, liveCustomProvider?.name, liveProviderApiKey, liveProviderId, savedProviders, state?.activeSavedProviderId]);
-  const effectiveActiveProviderId = liveProviderId === "custom" ? inferredActiveProviderId : liveProviderId;
+    if (state?.isOfficialProvider) return "";
+    if (state?.activeSavedProviderId && savedProviders.some((item) => item.id === state.activeSavedProviderId)) {
+      return state.activeSavedProviderId;
+    }
+    return liveProviderId !== "custom" ? liveProviderId : "";
+  }, [liveProviderId, savedProviders, state?.activeSavedProviderId, state?.isOfficialProvider]);
+  const effectiveActiveProviderId = state?.isOfficialProvider ? "" : inferredActiveProviderId;
   const currentInstructionPath = (state?.instructionFile || "").replace(/\\/g, "/");
   const currentInstructionFilename = currentInstructionPath.split("/").pop() || "";
   const activeInstructionTitle = React.useMemo(() => {
@@ -1050,7 +996,8 @@ function App() {
   }, [activeProviderId, effectiveActiveProviderId, savedProviders]);
 
   const detectedRows = React.useMemo(() => {
-    return (state?.providers || []).map((p) => {
+    if (state?.isOfficialProvider) return [];
+    return (state?.providers || []).filter((p) => p.isCurrent).map((p) => {
       const configKey = extractTomlProviderApiKey(state?.configText, p.id);
       const apiKey = p.isCurrent ? liveProviderApiKey || configKey : configKey;
       return {
@@ -1065,7 +1012,7 @@ function App() {
         isCurrent: p.isCurrent,
       };
     });
-  }, [liveProviderApiKey, state?.configText, state?.model, state?.providers]);
+  }, [liveProviderApiKey, state?.configText, state?.isOfficialProvider, state?.model, state?.providers]);
 
   const localRows = React.useMemo(() => {
     return canonicalSavedProviders.map((p) => ({
@@ -1085,7 +1032,7 @@ function App() {
       apiKey: "",
       wireApi: "official",
       requiresOpenaiAuth: false,
-      isCurrent: !state?.modelProvider || state.modelProvider === "openai",
+      isCurrent: Boolean(state?.isOfficialProvider),
     };
     const seen = new Set<string>();
     const rows: Array<typeof officialRow | (typeof detectedRows)[number] | (typeof localRows)[number]> = [officialRow];
@@ -1102,7 +1049,7 @@ function App() {
       rows.push(row);
     });
     return rows;
-  }, [detectedRows, inferredActiveProviderId, localRows, state?.model, state?.modelProvider]);
+  }, [detectedRows, inferredActiveProviderId, localRows, state?.isOfficialProvider, state?.model]);
 
   const findLocalProviderForRow = React.useCallback((row: ProviderRow) => {
     if (row.source === "official") return undefined;
@@ -1178,19 +1125,9 @@ function App() {
     return Array.from(groups.entries()).sort((a, b) => b[1].length - a[1].length);
   }, [filteredSessions, lang, sessionGroupByCwd]);
 
-  const sessionRolloutMismatchCount = sessionStatus?.mismatchedRollouts ?? 0;
-  const sessionIndexMismatchCount = sessionStatus?.mismatchedThreads ?? 0;
   const sessionHasMismatches = Boolean(sessionStatus?.needsSync);
-  const sessionTargetProvider = sessionStatus?.targetProvider || state?.modelProvider || "openai";
-  const sessionTargetLabel = canonicalSavedProviders.find((item) => item.id === effectiveActiveProviderId)?.providerName
-    || currentProvider?.name
-    || sessionTargetProvider;
-  const previewSessionSyncCount = new Set(
-    (sessionStatus?.sessions || []).filter((item) => item.needsSync).map((item) => item.id),
-  ).size;
-  const sessionSyncCount = sessionHasMismatches
-    ? Math.max(1, previewSessionSyncCount, sessionRolloutMismatchCount, sessionIndexMismatchCount)
-    : 0;
+  const sessionTargetLabel = lang === "zh" ? "共享会话" : "Shared history";
+  const sessionSyncCount = sessionMismatchCount(sessionStatus);
   const sessionVisibleTotal = showInternalSessions
     ? (sessionStatus?.topLevelThreads ?? 0) + (sessionStatus?.subagentThreads ?? 0)
     : (sessionStatus?.topLevelThreads ?? 0);
@@ -1225,6 +1162,8 @@ function App() {
   }, []);
 
   const refresh = React.useCallback(() => {
+    const requestId = ++refreshRequestRef.current;
+    setSessionStatus(null);
     call(
       async () => {
         const [next, providerList, promptList, promptStatus, about] = await Promise.all([
@@ -1237,21 +1176,27 @@ function App() {
         return { next, providerList, promptList, promptStatus, about };
       },
       ({ next, providerList, promptList, promptStatus, about }) => {
+        if (requestId !== refreshRequestRef.current) return;
         setState(next);
         setSavedProviders(providerList);
         setSavedPrompts(promptList);
         setBuiltinPromptStatus(uniqueBuiltinPromptStatuses(promptStatus));
         setAboutInfo(about);
         const resolvedConfigDir = configDir || null;
-        void Promise.all([
-          invoke<StartupDiagnostics>("get_startup_diagnostics", { configDir: resolvedConfigDir }),
-          invoke<SessionSyncStatus>("get_session_sync_status", { configDir: resolvedConfigDir, targetProvider: null }),
-        ])
-          .then(([diagnostics, sessions]) => {
-            setStartupDiagnostics(diagnostics);
-            setSessionStatus(sessions);
+        void invoke<StartupDiagnostics>("get_startup_diagnostics", { configDir: resolvedConfigDir })
+          .then((diagnostics) => {
+            if (requestId === refreshRequestRef.current) setStartupDiagnostics(diagnostics);
           })
-          .catch(() => undefined);
+          .catch(() => {
+            if (requestId === refreshRequestRef.current) setStartupDiagnostics(null);
+          });
+        void invoke<SessionSyncStatus>("get_session_sync_status", { configDir: resolvedConfigDir, targetProvider: null })
+          .then((sessions) => {
+            if (requestId === refreshRequestRef.current) setSessionStatus(sessions);
+          })
+          .catch(() => {
+            if (requestId === refreshRequestRef.current) setSessionStatus(null);
+          });
       },
     );
   }, [call, configDir]);
@@ -1263,7 +1208,7 @@ function App() {
 
   React.useEffect(() => {
     if (!state) return;
-    if (liveProviderId !== "custom") {
+    if (state.isOfficialProvider) {
       if (activeProviderId) {
         localStorage.removeItem(ACTIVE_PROVIDER_KEY);
         setActiveProviderId("");
@@ -1271,9 +1216,12 @@ function App() {
       return;
     }
     if (!savedProviders.length) return;
-    if (inferredActiveProviderId && inferredActiveProviderId !== activeProviderId) {
-      localStorage.setItem(ACTIVE_PROVIDER_KEY, inferredActiveProviderId);
-      setActiveProviderId(inferredActiveProviderId);
+    const mappedProviderId = savedProviders.some((item) => item.id === inferredActiveProviderId)
+      ? inferredActiveProviderId
+      : "";
+    if (mappedProviderId && mappedProviderId !== activeProviderId) {
+      localStorage.setItem(ACTIVE_PROVIDER_KEY, mappedProviderId);
+      setActiveProviderId(mappedProviderId);
       return;
     }
     if (activeProviderId && !savedProviders.some((item) => item.id === activeProviderId)) {
@@ -1284,6 +1232,7 @@ function App() {
 
   const handleActionResult = (result: ActionResult) => {
     setState(result.state);
+    setSessionStatus(null);
     setToast(result.message);
     const resolvedConfigDir = configDir || null;
     void Promise.all([
@@ -1503,53 +1452,64 @@ function App() {
     baseUrl: providerForm.baseUrl.trim().replace(/\/+$/, ""),
     model: providerForm.model.trim(),
     apiKey: (providerForm.apiKey || "").trim(),
-    tomlConfig: (providerTomlDraft || providerForm.tomlConfig || buildProviderTomlPreview(providerForm, state)).trimEnd(),
+    tomlConfig: (providerTomlDraft || providerForm.tomlConfig || buildProviderTomlPreview(providerForm)).trimEnd(),
     wireApi: providerForm.wireApi || "responses",
     requiresOpenaiAuth: providerForm.requiresOpenaiAuth,
   });
 
+  const applyProviderConfig = (provider: SavedProvider) => {
+    const tomlConfig = provider.tomlConfig?.trim();
+    if (tomlConfig) {
+      return invoke<ActionResult>("save_provider_toml_config", {
+        input: {
+          configDir: configDir || null,
+          configText: tomlConfig,
+          apiKey: provider.apiKey || "",
+        },
+      });
+    }
+    return invoke<ActionResult>("switch_provider", {
+      input: {
+        configDir: configDir || null,
+        providerId: provider.id,
+        providerName: provider.providerName,
+        baseUrl: provider.baseUrl,
+        model: provider.model,
+        apiKey: provider.apiKey || "",
+        wireApi: provider.wireApi,
+        requiresOpenaiAuth: provider.requiresOpenaiAuth,
+      },
+    });
+  };
+
   const saveProviderOnly = () =>
     call(
       async () => {
-        const saved = await invoke<SavedProvider>("save_provider", { provider: normalizedProviderForm() });
+        const applyAfterSave = editingDetectedProvider
+          || Boolean(editingProviderId && editingProviderId === effectiveActiveProviderId);
+        const provider = normalizedProviderForm();
+        const applied = applyAfterSave
+          ? await invoke<ActionResult>("save_active_provider", { provider, configDir: configDir || null })
+          : null;
+        if (!applyAfterSave) await invoke<SavedProvider>("save_provider", { provider });
         const providerList = await invoke<SavedProvider[]>("list_saved_providers");
-        return { saved, providerList };
+        return { applied, providerList };
       },
-      ({ providerList }) => {
+      ({ applied, providerList }) => {
+        if (applied) handleActionResult(applied);
         setSavedProviders(providerList);
         setProviderMode("list");
         setEditingProviderId(null);
-        setProviderTomlDirty(false);
-        setToast(lang === "zh" ? "供应商配置已保存" : "Provider saved");
+        setEditingDetectedProvider(false);
+        setToast(applied
+          ? (lang === "zh" ? "供应商配置已保存并热更新" : "Provider saved and hot-applied")
+          : (lang === "zh" ? "供应商配置已保存" : "Provider saved"));
       },
     );
 
   const switchProvider = (provider: SavedProvider) =>
     call(
-      () => {
-        const tomlConfig = provider.tomlConfig?.trim();
-        if (tomlConfig) {
-          return invoke<ActionResult>("save_provider_toml_config", {
-            input: {
-              configDir: configDir || null,
-              configText: tomlConfig,
-              apiKey: provider.apiKey || "",
-            },
-          });
-        }
-        return invoke<ActionResult>("switch_provider", {
-          input: {
-            configDir: configDir || null,
-            providerId: provider.id,
-            providerName: provider.providerName,
-            baseUrl: provider.baseUrl,
-            model: provider.model,
-            apiKey: provider.apiKey || "",
-            wireApi: provider.wireApi,
-            requiresOpenaiAuth: provider.requiresOpenaiAuth,
-          },
-        });
-      },
+      () => applyProviderConfig(provider),
       (result) => {
         localStorage.setItem(ACTIVE_PROVIDER_KEY, provider.id);
         setActiveProviderId(provider.id);
@@ -1667,19 +1627,27 @@ function App() {
 
   const importFromCcSwitch = async () => {
     setActionBusy("importCcSwitch");
+    setError("");
     try {
-      await call(
-        () => invoke<ImportResult>("import_ccswitch_codex_providers", { dbPath: null }),
-        (result) => {
-          setSavedProviders(result.providers);
-          const warningText = result.skipped > 0 ? `，跳过 ${result.skipped}` : "";
-          setToast(
-            lang === "zh"
-              ? `cc-switch 导入完成：新增 ${result.added}，更新 ${result.updated}，合并 ${result.merged}${warningText}`
-              : `cc-switch import complete: ${result.added} added, ${result.updated} updated, ${result.merged} merged${warningText}`,
-          );
-        },
-      );
+      const result = await invoke<ImportResult>("import_ccswitch_codex_providers", { dbPath: null });
+      setSavedProviders(result.providers);
+      const warningText = result.skipped > 0
+        ? (lang === "zh" ? `，跳过 ${result.skipped}` : `, ${result.skipped} skipped`)
+        : "";
+      const successText = lang === "zh"
+        ? `cc-switch 导入完成：新增 ${result.added}，更新 ${result.updated}，合并 ${result.merged}${warningText}；未切换当前供应商`
+        : `cc-switch import complete: ${result.added} added, ${result.updated} updated, ${result.merged} merged${warningText}; current provider unchanged`;
+      setToast(successText);
+      try {
+        const nextState = await invoke<CodexState>("get_codex_state", { configDir: configDir || null });
+        setState(nextState);
+      } catch (refreshError) {
+        setToast(lang === "zh"
+          ? `${successText}；状态刷新失败，请手动刷新：${String(refreshError)}`
+          : `${successText}; state refresh failed, refresh manually: ${String(refreshError)}`);
+      }
+    } catch (importError) {
+      setError(String(importError));
     } finally {
       setActionBusy("");
     }
@@ -1901,7 +1869,8 @@ function App() {
   const officialAuthPlaceholder = '{\n  "OPENAI_API_KEY": null,\n  "auth_mode": "chatgpt",\n  "tokens": {\n    "access_token": "",\n    "refresh_token": "",\n    "id_token": ""\n  }\n}';
 
   const openOfficialEdit = async () => {
-    const liveIsOfficial = !state?.modelProvider || state.modelProvider === "openai";
+    const liveIsOfficial = Boolean(state?.isOfficialProvider);
+    setEditingDetectedProvider(false);
     setOfficialForm({
       model: state?.model || "gpt-5.5",
       authJson: liveIsOfficial && state?.authText ? state.authText : officialAuthPlaceholder,
@@ -1946,45 +1915,55 @@ function App() {
     const next = { ...blankProviderForm };
     resetAvailableProviderModels();
     setEditingProviderId(null);
+    setEditingDetectedProvider(false);
     setProviderForm(next);
-    setProviderTomlDraft(buildProviderTomlPreview(next, state));
-    setProviderTomlDirty(false);
+    setProviderTomlDraft(buildProviderTomlPreview(next));
     setProviderMode("form");
   };
 
   const openEditProvider = (provider: SavedProvider) => {
     resetAvailableProviderModels();
     setEditingProviderId(provider.id);
+    setEditingDetectedProvider(false);
     setProviderForm(provider);
-    setProviderTomlDraft(provider.tomlConfig?.trim() || buildProviderTomlPreview(provider, state));
-    setProviderTomlDirty(false);
+    setProviderTomlDraft(provider.tomlConfig?.trim() || buildProviderTomlPreview(provider));
     setProviderMode("form");
   };
 
   const openEditDetectedProvider = (provider: { id: string; providerName: string; baseUrl: string; model: string; apiKey?: string; wireApi: string; requiresOpenaiAuth: boolean }) => {
     resetAvailableProviderModels();
-    setEditingProviderId(null);
+    const id = uniqueId(
+      customProviderId(provider.providerName || provider.baseUrl),
+      savedProviders.map((item) => item.id),
+    );
+    setEditingProviderId(id);
+    setEditingDetectedProvider(true);
     const next = {
-      id: customProviderId(provider.providerName || provider.baseUrl),
+      id,
       providerName: provider.providerName,
       baseUrl: provider.baseUrl,
       model: provider.model,
-      apiKey: provider.apiKey || extractOpenAiApiKey(state?.authText),
+      apiKey: provider.apiKey || "",
       tomlConfig: "",
       wireApi: provider.wireApi || "responses",
       requiresOpenaiAuth: provider.requiresOpenaiAuth,
     };
     setProviderForm(next);
-    setProviderTomlDraft(buildProviderTomlPreview(next, state));
-    setProviderTomlDirty(false);
+    setProviderTomlDraft(buildProviderTomlPreview(next));
     setProviderMode("form");
   };
 
-  const removeProvider = async (id: string) => {
+  const removeProvider = async (id: string, isCurrent: boolean) => {
     setLoading(true);
     setError("");
     try {
-      await invoke<void>("delete_saved_provider", { id });
+      if (isCurrent) {
+        const result = await invoke<ActionResult>("switch_official_provider", { configDir: configDir || null });
+        localStorage.removeItem(ACTIVE_PROVIDER_KEY);
+        setActiveProviderId("");
+        setState(result.state);
+      }
+      await invoke<void>("delete_saved_provider", { id, configDir: configDir || null });
       const providerList = await invoke<SavedProvider[]>("list_saved_providers");
       setSavedProviders(providerList);
       setToast(lang === "zh" ? "供应商已删除" : "Provider deleted");
@@ -1999,15 +1978,17 @@ function App() {
 
   const checkSessions = async () => {
     setActionBusy("checkSessions");
+    setSessionStatus(null);
     await call(
       () => invoke<SessionSyncStatus>("get_session_sync_status", { configDir: configDir || null, targetProvider: null }),
       (status) => {
         setSessionStatus(status);
+        if (!status.scanComplete) {
+          setToast(status.scanFailures[0] || (lang === "zh" ? "无法确认会话同步状态" : "Unable to verify session sync status"));
+          return;
+        }
         const hasMismatches = Boolean(status.needsSync);
-        const previewCount = new Set(status.sessions.filter((item) => item.needsSync).map((item) => item.id)).size;
-        const syncCount = hasMismatches
-          ? Math.max(1, previewCount, status.mismatchedRollouts, status.mismatchedThreads)
-          : 0;
+        const syncCount = sessionMismatchCount(status);
         setToast(hasMismatches
           ? (lang === "zh" ? `有 ${syncCount} 条会话需要同步` : `${syncCount} session(s) need syncing`)
           : (lang === "zh" ? "全部会话已同步" : "All sessions are synced"));
@@ -2017,17 +1998,24 @@ function App() {
   };
 
   const syncSessions = async () => {
-    const pendingCount = sessionSyncCount;
     setActionBusy("syncSessions");
     await call(
       () => invoke<SessionSyncResult>("sync_sessions_provider", { configDir: configDir || null, targetProvider: null }),
       (result) => {
         setSessionStatus(result.status);
         setSelectedSessionIds([]);
-        const syncedCount = pendingCount || Math.max(result.updatedRollouts, result.updatedThreads);
-        setToast(lang === "zh"
-          ? `已同步 ${syncedCount} 条会话，聊天内容未改动`
-          : `Synced ${syncedCount} session(s). Chat content was not changed.`);
+        if (!result.status.scanComplete) {
+          setToast(result.status.scanFailures[0] || (lang === "zh" ? "无法确认会话同步状态" : "Unable to verify session sync status"));
+        } else if (result.status.needsSync) {
+          const remaining = sessionMismatchCount(result.status);
+          setToast(lang === "zh"
+            ? `已同步可写的会话索引，仍有 ${remaining} 条需要重试；聊天内容未改动`
+            : `Writable session indexes were synced; ${remaining} still need retrying. Chat content was not changed.`);
+        } else {
+          setToast(lang === "zh"
+            ? "会话索引已全部同步，聊天内容未改动"
+            : "All session indexes are synced. Chat content was not changed.");
+        }
       },
     );
     setActionBusy("");
@@ -2212,7 +2200,7 @@ function App() {
                 loading={loading}
                 testingId={providerTestingId}
                 actionBusy={actionBusy}
-                editingProviderId={editingProviderId}
+                editingProviderId={editingProviderId || (editingDetectedProvider ? providerForm.id : null)}
                 providerForm={{
                   apiKey: providerForm.apiKey || "",
                   baseUrl: providerForm.baseUrl,
@@ -2226,7 +2214,7 @@ function App() {
                 officialInfo={{
                   officialUrl: "https://chatgpt.com/codex",
                   authPath: state.authPath,
-                  current: (!state.modelProvider || state.modelProvider === "openai") ? "OpenAI Official" : state.modelProvider,
+                  current: state.isOfficialProvider ? "OpenAI Official" : state.modelProvider,
                 }}
                 providerAuthPreview={<JsonPreview text={providerAuthPreview} />}
                 providerTomlDraft={providerTomlDraft}
@@ -2268,11 +2256,14 @@ function App() {
                 }}
                 onDeleteProvider={(row) => {
                   const local = findLocalProviderForRow(row);
-                  return local ? removeProvider(local.id) : Promise.resolve(false);
+                  return local ? removeProvider(local.id, row.isCurrent) : Promise.resolve(false);
                 }}
                 onRestoreOfficial={restoreOfficialProvider}
                 onResetOfficial={resetOfficialProvider}
-                onCancelMode={() => setProviderMode("list")}
+                onCancelMode={() => {
+                  setProviderMode("list");
+                  setEditingDetectedProvider(false);
+                }}
                 onOfficialModelChange={(value) => setOfficialForm((current) => ({ ...current, model: value }))}
                 onOfficialAuthChange={(value) => setOfficialForm((current) => ({ ...current, authJson: value }))}
                 onSaveOfficial={saveOfficialConfig}
@@ -2294,14 +2285,8 @@ function App() {
                 onWireApiChange={(value) => setProviderForm((current) => ({ ...current, wireApi: value }))}
                 onRequiresAuthChange={(value) => setProviderForm((current) => ({ ...current, requiresOpenaiAuth: value }))}
                 onToggleApiKeyVisibility={() => setProviderApiKeyVisible((value) => !value)}
-                onProviderTomlDraftChange={(value) => {
-                  setProviderTomlDraft(value);
-                  setProviderTomlDirty(true);
-                }}
-                onResetProviderToml={() => {
-                  setProviderTomlDraft(providerTomlPreview);
-                  setProviderTomlDirty(false);
-                }}
+                onProviderTomlDraftChange={setProviderTomlDraft}
+                onResetProviderToml={() => setProviderTomlDraft(providerTomlPreview)}
                 onSaveProvider={saveProviderConfig}
               />
             )}

@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -33,7 +33,10 @@ pub(crate) struct SessionSyncStatus {
     pub(crate) top_level_threads: usize,
     pub(crate) subagent_threads: usize,
     pub(crate) mismatched_threads: usize,
+    pub(crate) mismatched_sessions: usize,
     pub(crate) needs_sync: bool,
+    pub(crate) scan_complete: bool,
+    pub(crate) scan_failures: Vec<String>,
     pub(crate) backup_dir: Option<String>,
     pub(crate) warnings: Vec<String>,
     pub(crate) sessions: Vec<SessionPreview>,
@@ -50,13 +53,16 @@ pub(crate) struct SessionSyncResult {
 
 #[derive(Debug, Default)]
 pub(crate) struct RolloutScan {
+    pub(crate) discovered_rollout_files: usize,
     pub(crate) rollout_files: usize,
     pub(crate) session_meta_count: usize,
     pub(crate) mismatched_rollouts: usize,
     pub(crate) mismatched_session_meta: usize,
     pub(crate) changes: Vec<SessionFileChange>,
     pub(crate) cwd_by_thread_id: HashMap<String, String>,
+    pub(crate) mismatched_thread_ids: HashSet<String>,
     pub(crate) warnings: Vec<String>,
+    pub(crate) scan_failures: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,5 +80,9 @@ pub(crate) struct SqliteScan {
     pub(crate) top_level_threads: usize,
     pub(crate) subagent_threads: usize,
     pub(crate) mismatched_threads: usize,
+    pub(crate) thread_ids: HashSet<String>,
+    pub(crate) rollout_paths_by_thread_id: HashMap<String, String>,
+    pub(crate) mismatched_thread_ids: HashSet<String>,
     pub(crate) warnings: Vec<String>,
+    pub(crate) scan_failures: Vec<String>,
 }

@@ -4,6 +4,17 @@ use crate::paths::app_home;
 use crate::sqlite_utils::table_column_set;
 use rusqlite::Connection;
 use std::path::PathBuf;
+use std::time::Duration;
+
+#[cfg(test)]
+pub(crate) fn test_db_guard() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static TEST_DB_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_DB_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("test app database lock poisoned")
+}
 
 fn db_path() -> Result<PathBuf> {
     Ok(app_home()?.join("codexx.db"))
@@ -40,6 +51,8 @@ pub(crate) fn open() -> Result<Connection> {
         ensure_directory(parent)?;
     }
     let conn = Connection::open(&path).map_err(|e| CodexxError::Database(e.to_string()))?;
+    conn.busy_timeout(Duration::from_secs(5))
+        .map_err(|e| CodexxError::Database(e.to_string()))?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS providers (
             id TEXT PRIMARY KEY,
@@ -50,6 +63,8 @@ pub(crate) fn open() -> Result<Connection> {
             toml_config TEXT,
             wire_api TEXT NOT NULL DEFAULT 'responses',
             requires_openai_auth INTEGER NOT NULL DEFAULT 1,
+            source TEXT NOT NULL DEFAULT 'manual',
+            source_id TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -102,6 +117,24 @@ pub(crate) fn open() -> Result<Connection> {
         "toml_config",
         "ALTER TABLE providers ADD COLUMN toml_config TEXT",
     )?;
+    ensure_sqlite_column(
+        &conn,
+        "providers",
+        "source",
+        "ALTER TABLE providers ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'",
+    )?;
+    ensure_sqlite_column(
+        &conn,
+        "providers",
+        "source_id",
+        "ALTER TABLE providers ADD COLUMN source_id TEXT",
+    )?;
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_providers_source_identity
+         ON providers(source, source_id)
+         WHERE source_id IS NOT NULL;",
+    )
+    .map_err(|e| CodexxError::Database(e.to_string()))?;
     conn.execute(
         "DELETE FROM prompts
          WHERE id LIKE 'external-%'

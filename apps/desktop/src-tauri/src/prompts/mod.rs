@@ -8,9 +8,11 @@ pub(crate) use catalog::{
     bundled_prompt_meta, bundled_prompt_metas, refresh_builtin_prompts_with_active,
 };
 pub(crate) use managed_agents::{
-    agents_path, install_managed_agents_block, managed_agents_bounds, managed_agents_template_key,
-    uninstall_managed_agents_block,
+    agents_path, install_managed_agents_block_in_content, managed_agents_bounds,
+    managed_agents_template_key, remove_managed_agents_block_from_content,
 };
+#[cfg(test)]
+pub(crate) use managed_agents::{install_managed_agents_block, uninstall_managed_agents_block};
 pub(crate) use store::{
     delete_prompt_inner, get_saved_prompt_inner, list_saved_prompts_inner,
     normalize_prompt_filename, save_builtin_prompt_override_inner, save_prompt_inner,

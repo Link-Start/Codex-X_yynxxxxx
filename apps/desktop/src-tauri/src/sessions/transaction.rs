@@ -1,6 +1,3 @@
-use super::global_state::{
-    apply_global_state_update_with_journal, restore_global_write, GlobalStateWrite,
-};
 use super::storage::{apply_session_changes, restore_session_changes};
 use super::types::{RolloutScan, SessionFileChange};
 use crate::error::{CodexxError, Result};
@@ -32,7 +29,6 @@ impl SqliteUpdateCounts {
 pub(super) struct MutationJournal {
     applied_rollouts: Vec<SessionFileChange>,
     sqlite_restore_attempts: Vec<SqliteRestoreAttempt>,
-    global_writes: Vec<GlobalStateWrite>,
 }
 
 #[derive(Debug, Clone)]
@@ -321,11 +317,6 @@ pub(super) fn rollback_mutation(
     pending_sqlite: &mut [PendingSqliteUpdate],
 ) -> Vec<String> {
     let mut errors = Vec::new();
-    for write in journal.global_writes.iter().rev() {
-        if let Err(error) = restore_global_write(write) {
-            errors.push(error.to_string());
-        }
-    }
     for attempt in journal.sqlite_restore_attempts.iter().rev() {
         let Some(update) = pending_sqlite
             .iter_mut()
@@ -358,7 +349,6 @@ pub(super) fn mutation_error(original: CodexxError, recovery_errors: Vec<String>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MutationPoint {
     AfterSqliteCommit(usize),
-    AfterGlobalMainWrite,
 }
 
 pub(super) struct MutationResult {
@@ -371,7 +361,6 @@ pub(super) fn execute_provider_sync_mutation<F>(
     rollouts: &RolloutScan,
     pending_sqlite: &mut [PendingSqliteUpdate],
     target_provider: &str,
-    global_state_path: &Path,
     journal: &mut MutationJournal,
     hook: &mut F,
 ) -> Result<MutationResult>
@@ -382,11 +371,6 @@ where
         let (applied_rollouts, skipped_rollouts) = apply_session_changes(&rollouts.changes)?;
         journal.applied_rollouts = applied_rollouts;
         apply_sqlite_updates(pending_sqlite, rollouts, target_provider)?;
-        apply_global_state_update_with_journal(
-            global_state_path,
-            &mut journal.global_writes,
-            &mut || hook(MutationPoint::AfterGlobalMainWrite),
-        )?;
         let sqlite_updates = commit_sqlite_updates(pending_sqlite, journal, hook)?;
         Ok(MutationResult {
             applied_rollouts: journal.applied_rollouts.len(),

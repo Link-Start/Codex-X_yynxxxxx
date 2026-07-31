@@ -1,7 +1,10 @@
 use crate::backups::create_backup;
 use crate::config_path;
 use crate::error::Result;
-use crate::file_io::{parse_toml_document, read_to_string_if_exists, write_text};
+use crate::file_io::parse_toml_document;
+use crate::live_config::{
+    acquire_live_config_lock, atomic_write_if_unchanged, read_file_snapshot, text_from_snapshot,
+};
 use std::path::Path;
 use toml_edit::{DocumentMut, Item, Table};
 
@@ -29,13 +32,16 @@ fn remove_markdown_path(table: &mut Table, key: &str) -> Option<Item> {
 /// Repairs prompt paths appended by older Codex-X versions after a `[tui]`
 /// header. Only the exact legacy keys with Markdown path values are touched.
 pub(crate) fn migrate_legacy_prompt_config(codex_dir: &Path) -> Result<bool> {
-    let cfg = config_path(codex_dir);
-    let text = read_to_string_if_exists(&cfg)?;
+    let _lock = acquire_live_config_lock(codex_dir)?;
+    migrate_legacy_prompt_config_locked(codex_dir)
+}
+
+pub(crate) fn migrated_legacy_prompt_config_text(cfg: &Path, text: &str) -> Result<Option<String>> {
     if text.trim().is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
 
-    let mut doc = parse_toml_document(&cfg, &text)?;
+    let mut doc = parse_toml_document(cfg, text)?;
     let nested_instruction = tui_table(&doc)
         .and_then(|tui| tui.get(MODEL_AVAILABILITY_NUX_KEY))
         .and_then(|item| item.as_table())
@@ -46,12 +52,10 @@ pub(crate) fn migrate_legacy_prompt_config(codex_dir: &Path) -> Result<bool> {
         tui_table(&doc).is_some_and(|tui| markdown_path(tui.get(MODEL_AVAILABILITY_NUX_KEY)));
 
     if !nested_instruction && !tui_instruction && !nux_as_instruction {
-        return Ok(false);
+        return Ok(None);
     }
 
     let root_instruction_exists = doc.as_table().contains_key(INSTRUCTION_KEY);
-    create_backup(codex_dir, "migrate-legacy-prompt-config")?;
-
     let removed_nested = doc
         .get_mut("tui")
         .and_then(|item| item.as_table_mut())
@@ -75,7 +79,19 @@ pub(crate) fn migrate_legacy_prompt_config(codex_dir: &Path) -> Result<bool> {
         doc.as_table_mut().insert(INSTRUCTION_KEY, instruction);
     }
 
-    write_text(&cfg, &doc.to_string())?;
+    Ok(Some(doc.to_string()))
+}
+
+pub(crate) fn migrate_legacy_prompt_config_locked(codex_dir: &Path) -> Result<bool> {
+    let cfg = config_path(codex_dir);
+    let original = read_file_snapshot(&cfg)?;
+    let text = text_from_snapshot(&cfg, original.as_deref())?;
+    let Some(migrated) = migrated_legacy_prompt_config_text(&cfg, &text)? else {
+        return Ok(false);
+    };
+    create_backup(codex_dir, "migrate-legacy-prompt-config")?;
+
+    atomic_write_if_unchanged(&cfg, original.as_deref(), migrated.as_bytes())?;
     Ok(true)
 }
 

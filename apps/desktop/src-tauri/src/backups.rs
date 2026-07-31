@@ -1,5 +1,5 @@
 use crate::constants::AGENTS_FILENAME;
-use crate::error::Result;
+use crate::error::{CodexxError, Result};
 use crate::file_io::{ensure_directory, io_err, write_json};
 use crate::paths::app_home;
 use crate::prompts::agents_path;
@@ -7,7 +7,7 @@ use crate::{auth_path, config_path};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,6 +38,84 @@ pub(crate) struct BackupEntry {
     had_config: bool,
     had_auth: bool,
     had_agents: bool,
+}
+
+fn lexical_absolute_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| io_err(path, error))?
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Ok(normalized)
+}
+
+/// Resolves every existing ancestor while retaining a normalized suffix. This
+/// compares missing CODEX_HOME targets without requiring the target to exist.
+fn normalized_path_identity(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| io_err(path, error))?
+            .join(path)
+    };
+    for ancestor in absolute.ancestors() {
+        match fs::canonicalize(ancestor) {
+            Ok(canonical) => {
+                let suffix = absolute
+                    .strip_prefix(ancestor)
+                    .expect("ancestor must be a path prefix");
+                return lexical_absolute_path(&canonical.join(suffix));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_err(ancestor, error)),
+        }
+    }
+    lexical_absolute_path(&absolute)
+}
+
+fn same_path_identity(left: &Path, right: &Path) -> Result<bool> {
+    let left = normalized_path_identity(left)?;
+    let right = normalized_path_identity(right)?;
+    #[cfg(target_os = "windows")]
+    {
+        let left = left.to_string_lossy().replace('/', "\\");
+        let right = right.to_string_lossy().replace('/', "\\");
+        Ok(left.eq_ignore_ascii_case(&right))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(left == right)
+    }
+}
+
+pub(crate) fn validate_backup_codex_dir(meta: &BackupMeta, codex_dir: &Path) -> Result<()> {
+    let recorded = meta.codex_dir.trim();
+    if recorded.is_empty() {
+        return Err(CodexxError::Config("备份元数据缺少 CODEX_HOME".to_string()));
+    }
+    if same_path_identity(Path::new(recorded), codex_dir)? {
+        return Ok(());
+    }
+    Err(CodexxError::Config(format!(
+        "备份属于其他 CODEX_HOME，拒绝恢复：备份为 {}，当前为 {}",
+        Path::new(recorded).display(),
+        codex_dir.display()
+    )))
 }
 
 fn backup_root() -> Result<PathBuf> {

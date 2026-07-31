@@ -1,6 +1,6 @@
 use crate::backups::{action_backup_root, BackupMeta};
 use crate::error::{CodexxError, Result};
-use crate::file_io::{ensure_directory, io_err, json_err, parse_toml_document, write_json};
+use crate::file_io::{ensure_directory, io_err, json_err, parse_toml_document, write_private_json};
 use crate::paths::app_home;
 use crate::{auth_path, config_path, string_value};
 use chrono::Local;
@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const SNAPSHOT_VERSION: u32 = 1;
+const SNAPSHOT_VERSION: u32 = 2;
+const LEGACY_SNAPSHOT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub(crate) struct OfficialConfigCandidate {
@@ -51,7 +52,7 @@ fn canonical_identity(path: &Path) -> String {
         .to_string()
 }
 
-fn snapshot_path(codex_dir: &Path) -> Result<PathBuf> {
+pub(crate) fn official_snapshot_path(codex_dir: &Path) -> Result<PathBuf> {
     let identity = canonical_identity(codex_dir);
     let digest = Sha256::digest(identity.as_bytes());
     Ok(app_home()?
@@ -103,6 +104,13 @@ fn is_chatgpt_auth(value: &Value) -> bool {
             })
 }
 
+fn has_openai_api_key(value: &Value) -> bool {
+    value
+        .get("OPENAI_API_KEY")
+        .and_then(Value::as_str)
+        .is_some_and(|key| !key.trim().is_empty())
+}
+
 fn read_auth_value(path: &Path) -> Result<Option<Value>> {
     if !path.is_file() {
         return Ok(None);
@@ -132,13 +140,43 @@ pub(crate) fn live_config_is_official(codex_dir: &Path) -> Result<bool> {
     }
     let text = fs::read_to_string(&path).map_err(|error| io_err(&path, error))?;
     let doc = parse_toml_document(&path, &text)?;
-    Ok(string_value(&doc, "model_provider")
-        .as_deref()
-        .is_none_or(|provider| provider.eq_ignore_ascii_case("openai")))
+    Ok(document_is_official(&doc))
+}
+
+pub(crate) fn document_is_official(doc: &toml_edit::DocumentMut) -> bool {
+    let Some(provider) = string_value(doc, "model_provider") else {
+        return true;
+    };
+    if provider.eq_ignore_ascii_case("openai") {
+        return true;
+    }
+    if provider != "custom" {
+        return false;
+    }
+    doc.get("model_providers")
+        .and_then(|item| item.as_table())
+        .and_then(|providers| providers.get("custom"))
+        .and_then(|item| item.as_table())
+        .is_some_and(|table| {
+            let has_no_endpoint = table
+                .get("base_url")
+                .and_then(|item| item.as_str())
+                .is_none_or(|value| value.trim().is_empty());
+            let is_openai = table
+                .get("name")
+                .and_then(|item| item.as_str())
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("openai"));
+            has_no_endpoint
+                && is_openai
+                && table
+                    .get("requires_openai_auth")
+                    .and_then(|item| item.as_bool())
+                    == Some(true)
+        })
 }
 
 fn write_snapshot(codex_dir: &Path, model: Option<String>, auth: Option<Value>) -> Result<()> {
-    let path = snapshot_path(codex_dir)?;
+    let path = official_snapshot_path(codex_dir)?;
     if let Some(parent) = path.parent() {
         ensure_directory(parent)?;
     }
@@ -151,14 +189,7 @@ fn write_snapshot(codex_dir: &Path, model: Option<String>, auth: Option<Value>) 
     };
     let value = serde_json::to_value(snapshot)
         .map_err(|error| CodexxError::Config(format!("序列化官方配置快照失败: {error}")))?;
-    write_json(&path, &value)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-            .map_err(|error| io_err(&path, error))?;
-    }
-    Ok(())
+    write_private_json(&path, &value)
 }
 
 pub(crate) fn save_official_config_snapshot(
@@ -178,25 +209,29 @@ pub(crate) fn mark_official_config_reset(codex_dir: &Path, model: Option<String>
     write_snapshot(codex_dir, model, None)
 }
 
-pub(crate) fn capture_live_official_config(codex_dir: &Path) -> Result<bool> {
-    if !live_config_is_official(codex_dir)? {
-        return Ok(false);
-    }
-    let Some(auth) = read_auth_value(&auth_path(codex_dir))? else {
-        return Ok(false);
-    };
-    save_official_config_snapshot(codex_dir, official_model(codex_dir)?, &auth)?;
-    Ok(true)
+pub(crate) fn capture_live_official_config_before_provider_switch(
+    codex_dir: &Path,
+) -> Result<bool> {
+    capture_live_official_auth(codex_dir, |auth| {
+        is_chatgpt_auth(auth) || has_openai_api_key(auth)
+    })
 }
 
 pub(crate) fn capture_live_chatgpt_config(codex_dir: &Path) -> Result<bool> {
+    capture_live_official_auth(codex_dir, is_chatgpt_auth)
+}
+
+fn capture_live_official_auth(
+    codex_dir: &Path,
+    is_trusted: impl FnOnce(&Value) -> bool,
+) -> Result<bool> {
     if !live_config_is_official(codex_dir)? {
         return Ok(false);
     }
     let Some(auth) = read_auth_value(&auth_path(codex_dir))? else {
         return Ok(false);
     };
-    if !is_chatgpt_auth(&auth) {
+    if !is_trusted(&auth) {
         return Ok(false);
     }
     save_official_config_snapshot(codex_dir, official_model(codex_dir)?, &auth)?;
@@ -204,14 +239,16 @@ pub(crate) fn capture_live_chatgpt_config(codex_dir: &Path) -> Result<bool> {
 }
 
 fn load_snapshot(codex_dir: &Path) -> Result<SnapshotState> {
-    let path = snapshot_path(codex_dir)?;
+    let path = official_snapshot_path(codex_dir)?;
     if !path.is_file() {
         return Ok(SnapshotState::Missing);
     }
     let text = fs::read_to_string(&path).map_err(|error| io_err(&path, error))?;
     let snapshot: OfficialConfigSnapshot =
         serde_json::from_str(&text).map_err(|error| json_err(&path, error))?;
-    if snapshot.version != SNAPSHOT_VERSION || snapshot.codex_dir != canonical_identity(codex_dir) {
+    if !matches!(snapshot.version, SNAPSHOT_VERSION | LEGACY_SNAPSHOT_VERSION)
+        || snapshot.codex_dir != canonical_identity(codex_dir)
+    {
         return Err(CodexxError::Config(format!(
             "官方配置快照与当前 CODEX_HOME 不匹配: {}",
             path.display()
@@ -225,6 +262,11 @@ fn load_snapshot(codex_dir: &Path) -> Result<SnapshotState> {
             "官方配置快照不包含可用认证: {}",
             path.display()
         )));
+    }
+    // Version 1 could be populated automatically from a proxy API key. Its
+    // API-key-only snapshots are ambiguous, so never restore or promote them.
+    if snapshot.version == LEGACY_SNAPSHOT_VERSION && !is_chatgpt_auth(&auth) {
+        return Ok(SnapshotState::Missing);
     }
     Ok(SnapshotState::Ready(OfficialConfigCandidate {
         auth,
@@ -244,9 +286,7 @@ fn backup_config_is_official(dir: &Path, meta: &BackupMeta) -> bool {
     let Ok(doc) = parse_toml_document(&path, &text) else {
         return false;
     };
-    string_value(&doc, "model_provider")
-        .as_deref()
-        .is_none_or(|provider| provider.eq_ignore_ascii_case("openai"))
+    document_is_official(&doc)
 }
 
 fn backup_model(dir: &Path, meta: &BackupMeta) -> Option<String> {
@@ -315,9 +355,14 @@ fn live_chatgpt_candidate(codex_dir: &Path) -> Result<Option<OfficialConfigCandi
     if !is_chatgpt_auth(&auth) {
         return Ok(None);
     }
+    let model = if live_config_is_official(codex_dir)? {
+        official_model(codex_dir)?
+    } else {
+        None
+    };
     Ok(Some(OfficialConfigCandidate {
         auth,
-        model: official_model(codex_dir)?,
+        model,
         source: "当前 ChatGPT 官方登录".to_string(),
     }))
 }
@@ -344,8 +389,10 @@ pub(crate) fn official_auth_available(codex_dir: &Path) -> Result<bool> {
         SnapshotState::Reset => return Ok(false),
         SnapshotState::Missing => {}
     }
-    if live_config_is_official(codex_dir)? && read_auth_value(&auth_path(codex_dir))?.is_some() {
-        return Ok(true);
+    if let Some(auth) = read_auth_value(&auth_path(codex_dir))? {
+        if is_chatgpt_auth(&auth) {
+            return Ok(true);
+        }
     }
     Ok(latest_official_backup(codex_dir)?.is_some())
 }
@@ -368,5 +415,5 @@ pub(crate) fn get_official_config_draft_inner(
 
 #[cfg(test)]
 pub(crate) fn official_snapshot_path_for_test(codex_dir: &Path) -> Result<PathBuf> {
-    snapshot_path(codex_dir)
+    official_snapshot_path(codex_dir)
 }
