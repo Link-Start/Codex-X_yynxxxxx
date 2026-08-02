@@ -1,5 +1,6 @@
 mod app_server;
 mod backup;
+mod catalog;
 mod delete;
 mod global_state;
 mod storage;

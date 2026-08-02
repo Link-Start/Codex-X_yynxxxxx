@@ -178,7 +178,8 @@ fn failed_sqlite_commit_rolls_back_without_snapshot_restore() {
         path: database.clone(),
         conn,
         observer,
-        columns: HashSet::new(),
+        thread_columns: HashSet::new(),
+        catalog_columns: HashSet::new(),
         counts: SqliteUpdateCounts::default(),
         transaction_open: true,
     }];

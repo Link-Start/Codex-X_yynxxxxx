@@ -10,7 +10,7 @@
 
   **Codex Prompts · API / Providers · Sessions · Skills / MCP in One Place**
 
-  A cross-platform desktop tool for **OpenAI Codex Desktop / Codex CLI**. Manage prompt templates, switch third-party APIs, organize / repair / permanently delete local sessions, manage Skills / MCP, apply macOS / Windows skins, and inspect TOML and login credentials without repeatedly editing configuration files by hand.
+  A cross-platform desktop tool for **OpenAI Codex Desktop / Codex CLI**. Manage prompt templates, switch third-party APIs, organize / repair / permanently delete local sessions, manage Skills / MCP, and inspect TOML and login credentials without repeatedly editing configuration files by hand.
 
   <p>
     <img src="https://img.shields.io/github/v/release/yynxxxxx/Codex-X?label=version&color=blue" alt="version" />
@@ -130,10 +130,6 @@ You can use it to:
   <tr>
     <td align="center">📝 <b>Manage config and login</b></td>
     <td align="left">Inspect the active Codex <code>config.toml</code> and <code>auth.json</code> in one place, with a clear distinction between official login credentials and third-party API Keys. Important writes are backed up automatically and can be restored when needed.</td>
-  </tr>
-  <tr>
-    <td align="center">🎨 <b>Apply macOS / Windows skins</b></td>
-    <td align="left">Use the bundled Shiina Mashiro art-studio theme with real-wallpaper, full-interface previews. Import or export packs, hot-switch themes, and turn the skin off directly. The runtime is built into Codex-X; the separate Codex Dream Skin engine is not required.</td>
   </tr>
   <tr>
     <td align="center">📦 <b>Use it across platforms</b></td>
@@ -404,15 +400,6 @@ pnpm --dir apps/desktop tauri build
 ```
 
 ## Desktop Installation Notes
-
-### Skin Center security boundary
-
-- Live skin application supports macOS and Windows. Linux can still manage, import, and export packs but is never reported as applied.
-- macOS uses only the signed Node.js bundled with the official Codex app and validates its bundle and process identity. Windows dynamically validates the current user's registered `OpenAI.Codex` Store package and uses the pinned Node.js 22 runtime shipped with Codex-X releases.
-- CDP binds only to `127.0.0.1`; Codex-X does not modify the official `.app`, `WindowsApps`, `app.asar`, code signature, directory permissions, or `config.toml`.
-- First application usually asks to restart Codex. Turn off skin removes the live interface skin immediately, and any theme can be applied again later.
-- Themes adapt cropping from image dimensions and content. Subject-focused artwork can use `art.focusX`, `art.focusY` (`0` to `1`), and `art.safeArea` in `theme.json` for precise framing without generating duplicate images for the same theme.
-- Injection is based on the MIT-licensed [Fei-Away/Codex-Dream-Skin](https://github.com/Fei-Away/Codex-Dream-Skin) source. The pinned source and license notice are in `apps/desktop/src-tauri/resources/skin-runtime/NOTICE.md`.
 
 If you see “app is damaged” when opening an unsigned / unnotarized DMG, this is normal macOS Gatekeeper behavior.
 

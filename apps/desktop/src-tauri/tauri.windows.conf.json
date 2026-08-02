@@ -1,7 +1,0 @@
-{
-  "bundle": {
-    "resources": {
-      "runtime/windows/node/*": "skin-runtime/node/"
-    }
-  }
-}

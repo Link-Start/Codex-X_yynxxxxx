@@ -2773,7 +2773,7 @@ fn user_event_flag_does_not_make_sessions_need_provider_sync() {
 }
 
 #[test]
-fn provider_sync_updates_only_active_provider_without_touching_cwd_or_user_flag() {
+fn provider_sync_updates_all_provider_indexes_without_touching_cwd_or_user_flag() {
     let codex_dir = temp_codex_dir("target-provider-all-dbs");
     write_text(
         &codex_dir.join("config.toml"),
@@ -2816,10 +2816,10 @@ fn provider_sync_updates_only_active_provider_without_touching_cwd_or_user_flag(
         Some(codex_dir.display().to_string()),
         Some("custom".to_string()),
     )
-    .expect("sync active database");
+    .expect("sync all session databases");
     assert_eq!(result.updated_rollouts, 1);
-    assert_eq!(result.updated_threads, 1);
-    for (index, database) in databases.iter().enumerate() {
+    assert_eq!(result.updated_threads, 2);
+    for database in &databases {
         let repaired = Connection::open(database)
             .expect("open repaired sqlite")
             .query_row(
@@ -2834,10 +2834,9 @@ fn provider_sync_updates_only_active_provider_without_touching_cwd_or_user_flag(
                 },
             )
             .expect("read repaired metadata");
-        let expected_provider = if index == 0 { "openai" } else { "custom" };
         assert_eq!(
             repaired,
-            (expected_provider.to_string(), 0, "/tmp/wrong".to_string())
+            ("custom".to_string(), 0, "/tmp/wrong".to_string())
         );
     }
 

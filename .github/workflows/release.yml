@@ -221,31 +221,6 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Stage pinned Windows skin runtime
-        if: matrix.platform == 'windows-latest'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $version = '22.23.1'
-          $expectedSha256 = '7df0bc9375723f4a86b3aa1b7cc73342423d9677a8df4538aca31a049e309c29'
-          $archive = Join-Path $env:RUNNER_TEMP "node-v$version-win-x64.zip"
-          $extractRoot = Join-Path $env:RUNNER_TEMP "codex-x-node-$version"
-          $targetRoot = 'apps/desktop/src-tauri/runtime/windows/node'
-          Invoke-WebRequest -Uri "https://nodejs.org/dist/v$version/node-v$version-win-x64.zip" -OutFile $archive
-          $actualSha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualSha256 -cne $expectedSha256) {
-            throw "Node.js archive checksum mismatch: $actualSha256"
-          }
-          Remove-Item -LiteralPath $extractRoot -Recurse -Force -ErrorAction SilentlyContinue
-          Expand-Archive -LiteralPath $archive -DestinationPath $extractRoot
-          $sourceRoot = Join-Path $extractRoot "node-v$version-win-x64"
-          New-Item -ItemType Directory -Path $targetRoot -Force | Out-Null
-          Copy-Item -LiteralPath (Join-Path $sourceRoot 'node.exe') -Destination $targetRoot -Force
-          Copy-Item -LiteralPath (Join-Path $sourceRoot 'LICENSE') -Destination $targetRoot -Force
-          if (-not (Test-Path -LiteralPath (Join-Path $targetRoot 'node.exe') -PathType Leaf)) {
-            throw 'Pinned Windows Node.js runtime was not staged.'
-          }
-
       - name: Test Windows filesystem compatibility
         if: matrix.platform == 'windows-latest'
         run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --lib --locked
@@ -380,9 +355,6 @@ jobs:
           rm -rf "$portable_root"
           mkdir -p "$portable_dir"
           cp apps/desktop/src-tauri/target/release/codex-x.exe "$portable_dir/Codex-X.exe"
-          mkdir -p "$portable_dir/skin-runtime/node"
-          cp apps/desktop/src-tauri/runtime/windows/node/node.exe "$portable_dir/skin-runtime/node/node.exe"
-          cp apps/desktop/src-tauri/runtime/windows/node/LICENSE "$portable_dir/skin-runtime/node/LICENSE"
           touch "$portable_dir/Codex-X.portable"
           cat > "$portable_dir/README-portable.txt" <<'EOF'
           Codex-X Windows Portable
@@ -390,7 +362,6 @@ jobs:
           Double click Codex-X.exe to run. No MSI installation is required.
           The portable edition uses manual downloads instead of in-app installation.
           Keep Codex-X.portable next to Codex-X.exe so the app can identify this edition.
-          Keep the skin-runtime directory beside Codex-X.exe; it contains the verified Windows skin runtime.
           Microsoft Edge WebView2 Runtime is required; Windows 10/11 usually already includes it.
           EOF
           powershell -NoProfile -Command "Compress-Archive -Path '${portable_dir}/*' -DestinationPath '${archive}' -Force"

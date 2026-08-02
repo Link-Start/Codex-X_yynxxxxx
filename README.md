@@ -10,7 +10,7 @@
 
   **Codex 可视化提示词注入 · Provider · 会话 · Skills / MCP 管理工具**
 
-  一款面向 **OpenAI Codex 桌面端 / Codex CLI** 的跨平台桌面工具。把提示词模板、自定义 Prompt、第三方 API 供应商、会话同步、Skills / MCP、macOS / Windows 皮肤和 TOML 配置都放进可视化界面里，不用反复手改文件。
+  一款面向 **OpenAI Codex 桌面端 / Codex CLI** 的跨平台桌面工具。把提示词模板、自定义 Prompt、第三方 API 供应商、会话同步、Skills / MCP 和 TOML 配置都放进可视化界面里，不用反复手改文件。
 
   <p>
     <img src="https://img.shields.io/github/v/release/yynxxxxx/Codex-X?label=version&color=blue" alt="version" />
@@ -110,10 +110,6 @@
   <tr>
     <td align="center"><b>配置与登录</b></td>
     <td align="left">集中查看 Codex 当前使用的 <code>config.toml</code> 与 <code>auth.json</code>，区分官方登录态和第三方 API Key；重要写入前自动备份。</td>
-  </tr>
-  <tr>
-    <td align="center"><b>macOS / Windows 皮肤中心</b></td>
-    <td align="left">内置“椎名真白·樱花画室”主题，以真实壁纸和完整界面缩略图展示主题效果，支持导入 / 导出、热切换和关闭皮肤；换肤运行时已经内置在 Codex-X 中，无需另装 Codex Dream Skin 引擎。</td>
   </tr>
   <tr>
     <td align="center"><b>跨平台使用</b></td>
@@ -393,15 +389,6 @@ pnpm --dir apps/desktop tauri build
 ```
 
 ## 桌面端安装说明
-
-### 皮肤中心安全边界
-
-- 实机换肤支持 macOS 和 Windows；Linux 仍可管理、导入和导出主题包，但不会显示为已应用。
-- macOS 只使用官方 Codex 内置且签名一致的 Node.js，并校验 Bundle ID、代码签名和进程归属；Windows 动态校验当前用户注册的 `OpenAI.Codex` Store 包，并使用发布包内固定校验的 Node.js 22 运行时。
-- CDP 仅绑定 `127.0.0.1`，不修改官方 `.app`、`WindowsApps`、`app.asar`、代码签名、目录权限或 `config.toml`。
-- 首次应用通常需要确认重启 Codex；“关闭皮肤”会立即移除当前界面皮肤，之后可随时重新应用主题。
-- 主题默认会根据图片尺寸和内容自适应裁切；人物或主体构图可在 `theme.json` 使用 `art.focusX`、`art.focusY`（`0` 到 `1`）和 `art.safeArea` 精确控制，无需为同一主题重复生成图片。
-- 注入实现基于 [Fei-Away/Codex-Dream-Skin](https://github.com/Fei-Away/Codex-Dream-Skin) 的 MIT 源码，固定来源和许可见 `apps/desktop/src-tauri/resources/skin-runtime/NOTICE.md`。
 
 如果你在未签名 / 未公证的 DMG 中看到“软件已损坏”提示，这是 macOS Gatekeeper 的正常行为。
 

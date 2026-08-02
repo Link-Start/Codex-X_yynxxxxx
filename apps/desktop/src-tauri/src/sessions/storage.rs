@@ -1253,7 +1253,7 @@ mod tests {
     }
 
     #[test]
-    fn root_state_10_uses_shared_bucket_even_when_openai_is_requested() {
+    fn root_state_10_honors_an_explicit_provider_target() {
         let codex_dir = temp_codex_dir("root-state-10");
         let database = codex_dir.join("state_10.sqlite");
         let id = "019f6000-0000-7000-8000-000000000301";
@@ -1282,17 +1282,17 @@ mod tests {
             Some(codex_dir.display().to_string()),
             Some("openai".to_string()),
         )
-        .expect("read shared bucket status");
-        assert_eq!(status.target_provider, "custom");
-        assert!(status.needs_sync);
+        .expect("read explicit provider status");
+        assert_eq!(status.target_provider, "openai");
+        assert!(!status.needs_sync);
 
         let result = crate::sessions::sync::sync_sessions_provider_inner(
             Some(codex_dir.display().to_string()),
             Some("openai".to_string()),
         )
         .expect("sync root state_10");
-        assert_eq!(result.status.target_provider, "custom");
-        assert_eq!(result.updated_threads, 1);
+        assert_eq!(result.status.target_provider, "openai");
+        assert_eq!(result.updated_threads, 0);
         let provider: String = Connection::open(&database)
             .expect("reopen state_10")
             .query_row(
@@ -1301,7 +1301,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("read updated provider");
-        assert_eq!(provider, "custom");
+        assert_eq!(provider, "openai");
 
         let _ = fs::remove_dir_all(codex_dir);
     }

@@ -1,10 +1,14 @@
+use super::catalog::{
+    apply_catalog_updates, catalog_columns, create_catalog_rollback_tables,
+    restore_catalog_updates, CatalogRepairThread,
+};
 use super::storage::{apply_session_changes, restore_session_changes};
 use super::types::{RolloutScan, SessionFileChange};
 use crate::error::{CodexxError, Result};
 use crate::file_io::io_err;
 use crate::sqlite_utils::{sqlite_has_table, table_column_set};
 use rusqlite::{Connection, OpenFlags};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -12,16 +16,18 @@ use std::time::Duration;
 pub(super) struct SqliteUpdateCounts {
     provider_rows: usize,
     cwd_rows: usize,
+    catalog_insert_rows: usize,
 }
 
 impl SqliteUpdateCounts {
     pub(super) fn total(&self) -> usize {
-        self.provider_rows + self.cwd_rows
+        self.provider_rows + self.cwd_rows + self.catalog_insert_rows
     }
 
     fn add(&mut self, other: Self) {
         self.provider_rows += other.provider_rows;
         self.cwd_rows += other.cwd_rows;
+        self.catalog_insert_rows += other.catalog_insert_rows;
     }
 }
 
@@ -41,7 +47,8 @@ pub(super) struct PendingSqliteUpdate {
     path: PathBuf,
     conn: Connection,
     observer: Connection,
-    columns: HashSet<String>,
+    thread_columns: HashSet<String>,
+    catalog_columns: HashSet<String>,
     counts: SqliteUpdateCounts,
     transaction_open: bool,
 }
@@ -76,7 +83,8 @@ fn create_sqlite_rollback_table(conn: &Connection) -> Result<()> {
             cwd_changed INTEGER NOT NULL DEFAULT 0
          );",
     )
-    .map_err(|error| CodexxError::Database(error.to_string()))
+    .map_err(|error| CodexxError::Database(error.to_string()))?;
+    create_catalog_rollback_tables(conn)
 }
 
 pub(super) fn prepare_sqlite_updates(sqlite_paths: &[PathBuf]) -> Result<Vec<PendingSqliteUpdate>> {
@@ -103,11 +111,17 @@ pub(super) fn prepare_sqlite_updates(sqlite_paths: &[PathBuf]) -> Result<Vec<Pen
             })?;
             conn.busy_timeout(Duration::from_secs(5))
                 .map_err(|error| CodexxError::Database(error.to_string()))?;
-            if !sqlite_has_table(&conn, "threads")? {
-                continue;
-            }
-            let columns = table_column_set(&conn, "threads")?;
-            if !columns.contains("id") || !columns.contains("model_provider") {
+            let thread_columns = if sqlite_has_table(&conn, "threads")? {
+                table_column_set(&conn, "threads")?
+            } else {
+                HashSet::new()
+            };
+            let catalog_columns = catalog_columns(&conn)?;
+            let supports_thread_updates =
+                thread_columns.contains("id") && thread_columns.contains("model_provider");
+            let supports_catalog_updates =
+                catalog_columns.contains("thread_id") && catalog_columns.contains("model_provider");
+            if !supports_thread_updates && !supports_catalog_updates {
                 continue;
             }
             conn.execute_batch("BEGIN IMMEDIATE")
@@ -143,7 +157,8 @@ pub(super) fn prepare_sqlite_updates(sqlite_paths: &[PathBuf]) -> Result<Vec<Pen
                 path: identity,
                 conn,
                 observer,
-                columns,
+                thread_columns,
+                catalog_columns,
                 counts: SqliteUpdateCounts::default(),
                 transaction_open: true,
             });
@@ -161,30 +176,35 @@ fn apply_sqlite_updates(
     pending: &mut [PendingSqliteUpdate],
     rollouts: &RolloutScan,
     target_provider: &str,
+    catalog_sources: &HashMap<String, CatalogRepairThread>,
 ) -> Result<()> {
     for update in pending.iter_mut() {
-        update
-            .conn
-            .execute(
-                "INSERT INTO temp.codexx_session_rollback
-                    (id, model_provider, provider_changed)
-                 SELECT id, model_provider, 1 FROM threads
-                 WHERE COALESCE(model_provider, '') <> ?1
-                 ON CONFLICT(id) DO UPDATE SET
-                    model_provider = excluded.model_provider,
-                    provider_changed = 1",
-                [target_provider],
-            )
-            .map_err(|error| CodexxError::Database(error.to_string()))?;
-        update.counts.provider_rows = update
-            .conn
-            .execute(
-                "UPDATE threads SET model_provider = ?1 WHERE COALESCE(model_provider, '') <> ?1",
-                [target_provider],
-            )
-            .map_err(|error| CodexxError::Database(error.to_string()))?;
+        if update.thread_columns.contains("id") && update.thread_columns.contains("model_provider")
+        {
+            update
+                .conn
+                .execute(
+                    "INSERT INTO temp.codexx_session_rollback
+                        (id, model_provider, provider_changed)
+                     SELECT id, model_provider, 1 FROM threads
+                     WHERE COALESCE(model_provider, '') <> ?1
+                     ON CONFLICT(id) DO UPDATE SET
+                        model_provider = excluded.model_provider,
+                        provider_changed = 1",
+                    [target_provider],
+                )
+                .map_err(|error| CodexxError::Database(error.to_string()))?;
+            update.counts.provider_rows += update
+                .conn
+                .execute(
+                    "UPDATE threads SET model_provider = ?1 \
+                     WHERE COALESCE(model_provider, '') <> ?1",
+                    [target_provider],
+                )
+                .map_err(|error| CodexxError::Database(error.to_string()))?;
+        }
 
-        if update.columns.contains("id") && update.columns.contains("cwd") {
+        if update.thread_columns.contains("id") && update.thread_columns.contains("cwd") {
             for (thread_id, cwd) in &rollouts.cwd_by_thread_id {
                 update
                     .conn
@@ -208,6 +228,14 @@ fn apply_sqlite_updates(
                     .map_err(|error| CodexxError::Database(error.to_string()))?;
             }
         }
+        let catalog_counts = apply_catalog_updates(
+            &update.conn,
+            &update.catalog_columns,
+            target_provider,
+            catalog_sources,
+        )?;
+        update.counts.provider_rows += catalog_counts.provider_rows;
+        update.counts.catalog_insert_rows += catalog_counts.inserted_rows;
     }
     Ok(())
 }
@@ -269,18 +297,23 @@ fn restore_sqlite_update(
             )));
         }
 
-        let mut statements = vec![
-            "UPDATE threads
-             SET model_provider = (
-                SELECT rollback.model_provider
-                FROM temp.codexx_session_rollback AS rollback
-                WHERE rollback.id = threads.id
-             )
-             WHERE id IN (
-                SELECT id FROM temp.codexx_session_rollback WHERE provider_changed = 1
-             )",
-        ];
-        if update.columns.contains("cwd") {
+        restore_catalog_updates(&update.conn, &update.catalog_columns)?;
+        let mut statements = Vec::new();
+        if update.thread_columns.contains("id") && update.thread_columns.contains("model_provider")
+        {
+            statements.push(
+                "UPDATE threads
+                 SET model_provider = (
+                    SELECT rollback.model_provider
+                    FROM temp.codexx_session_rollback AS rollback
+                    WHERE rollback.id = threads.id
+                 )
+                 WHERE id IN (
+                    SELECT id FROM temp.codexx_session_rollback WHERE provider_changed = 1
+                 )",
+            );
+        }
+        if update.thread_columns.contains("id") && update.thread_columns.contains("cwd") {
             statements.push(
                 "UPDATE threads
                  SET cwd = (
@@ -361,6 +394,7 @@ pub(super) fn execute_provider_sync_mutation<F>(
     rollouts: &RolloutScan,
     pending_sqlite: &mut [PendingSqliteUpdate],
     target_provider: &str,
+    catalog_sources: &HashMap<String, CatalogRepairThread>,
     journal: &mut MutationJournal,
     hook: &mut F,
 ) -> Result<MutationResult>
@@ -370,7 +404,7 @@ where
     let result = (|| -> Result<MutationResult> {
         let (applied_rollouts, skipped_rollouts) = apply_session_changes(&rollouts.changes)?;
         journal.applied_rollouts = applied_rollouts;
-        apply_sqlite_updates(pending_sqlite, rollouts, target_provider)?;
+        apply_sqlite_updates(pending_sqlite, rollouts, target_provider, catalog_sources)?;
         let sqlite_updates = commit_sqlite_updates(pending_sqlite, journal, hook)?;
         Ok(MutationResult {
             applied_rollouts: journal.applied_rollouts.len(),

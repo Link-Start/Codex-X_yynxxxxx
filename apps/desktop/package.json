@@ -1,6 +1,6 @@
 {
   "name": "codex-x",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "private": true,
   "description": "Codex Switch & Instruct desktop manager",
   "type": "module",
@@ -10,12 +10,10 @@
     "tauri": "tauri",
     "dev:renderer": "vite --host 127.0.0.1 --port 1420",
     "build:renderer": "vite build",
-    "typecheck": "tsc --noEmit",
-    "test:skin-runtime": "node src-tauri/resources/skin-runtime/tests/run-tests.mjs"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",
-    "@tauri-apps/plugin-dialog": "^2.7.2",
     "@tauri-apps/plugin-process": "^2.3.1",
     "@tauri-apps/plugin-updater": "^2.10.1",
     "lucide-react": "^0.542.0",

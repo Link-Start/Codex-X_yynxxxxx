@@ -1,7 +1,9 @@
 use super::backup::{create_provider_sync_backup, prune_provider_sync_backups};
+use super::catalog::{scan_catalog_sync, CatalogSyncScan};
 use super::storage::{
-    current_model_provider, discover_sqlite_databases, list_session_previews_with_paths,
-    scan_rollouts_for_thread_ids, scan_sqlite_with_paths, SqliteDiscovery,
+    current_model_provider, discover_sqlite_databases, ensure_sqlite_discovery_writable,
+    list_session_previews_with_paths, scan_rollouts, scan_rollouts_for_thread_ids,
+    scan_sqlite_with_paths, SqliteDiscovery,
 };
 use super::transaction::{
     execute_provider_sync_mutation, mutation_error, prepare_sqlite_updates, rollback_mutation,
@@ -15,18 +17,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-
-const SHARED_SESSION_PROVIDER: &str = "custom";
-
-fn live_route_failure(codex_dir: &Path) -> Option<String> {
-    match current_model_provider(codex_dir, None) {
-        Ok(provider) if provider.trim() == SHARED_SESSION_PROVIDER => None,
-        Ok(provider) => Some(format!(
-            "当前 Codex 配置的 model_provider 为 {provider:?}，未路由到共享 custom 会话；已停止同步，请先重新启用官方配置或供应商。"
-        )),
-        Err(error) => Some(format!("无法验证当前 Codex 配置的 model_provider: {error}")),
-    }
-}
 
 fn scan_failure_error(failures: &[String]) -> CodexxError {
     CodexxError::Config(
@@ -53,90 +43,205 @@ fn scan_provider_buckets(
     Ok(rollouts)
 }
 
+fn scan_legacy_index_warnings(
+    codex_dir: &Path,
+    target_provider: &str,
+    discovery: &SqliteDiscovery,
+) -> Vec<String> {
+    if discovery.active_paths.is_empty() {
+        return Vec::new();
+    }
+    let legacy_paths = discovery
+        .thread_paths
+        .iter()
+        .filter(|path| !discovery.active_paths.contains(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if legacy_paths.is_empty() {
+        return Vec::new();
+    }
+    let failures = scan_sqlite_with_paths(&legacy_paths, &RolloutScan::default(), target_provider)
+        .and_then(|sqlite| scan_provider_buckets(codex_dir, target_provider, &sqlite))
+        .map(|scan| scan.scan_failures)
+        .unwrap_or_else(|error| vec![error.to_string()]);
+    failures
+        .into_iter()
+        .map(|failure| format!("已忽略旧会话索引异常：{failure}"))
+        .collect()
+}
+
+struct ProviderSyncScan {
+    active_sqlite: SqliteScan,
+    sqlite: SqliteScan,
+    rollouts: RolloutScan,
+    catalog: CatalogSyncScan,
+    scan_failures: Vec<String>,
+    warnings: Vec<String>,
+}
+
+fn scan_provider_sync_data(
+    codex_dir: &Path,
+    target_provider: &str,
+    discovery: &SqliteDiscovery,
+) -> Result<ProviderSyncScan> {
+    let active_sqlite = scan_sqlite_with_paths(
+        &discovery.active_paths,
+        &RolloutScan::default(),
+        target_provider,
+    )?;
+    let sqlite = scan_sqlite_with_paths(
+        &discovery.thread_paths,
+        &RolloutScan::default(),
+        target_provider,
+    )?;
+    let indexed_rollouts = if active_sqlite.sqlite_dbs > 0 {
+        scan_provider_buckets(codex_dir, target_provider, &active_sqlite)?
+    } else {
+        scan_provider_buckets(codex_dir, target_provider, &sqlite)?
+    };
+    let legacy_index_warnings = scan_legacy_index_warnings(codex_dir, target_provider, discovery);
+    let mut rollouts = scan_rollouts(codex_dir, target_provider)?;
+    // Provider synchronization changes provider routing only; cwd remains independently managed.
+    rollouts.cwd_by_thread_id.clear();
+    let catalog = scan_catalog_sync(
+        &discovery.thread_paths,
+        &discovery.related_paths,
+        target_provider,
+    )?;
+
+    let mut scan_failures = discovery.active_scan_failures.clone();
+    scan_failures.extend(active_sqlite.scan_failures.iter().cloned());
+    scan_failures.extend(sqlite.scan_failures.iter().cloned());
+    scan_failures.extend(indexed_rollouts.scan_failures.iter().cloned());
+    for path in &discovery.unreadable_paths {
+        scan_failures.push(format!("无法读取会话数据库: {}", path.display()));
+    }
+
+    let indexed_failures = indexed_rollouts
+        .scan_failures
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut warnings = rollouts.warnings.clone();
+    warnings.extend(active_sqlite.warnings.iter().cloned());
+    warnings.extend(sqlite.warnings.iter().cloned());
+    warnings.extend(legacy_index_warnings);
+    warnings.extend(
+        rollouts
+            .scan_failures
+            .iter()
+            .filter(|failure| !indexed_failures.contains(*failure))
+            .map(|failure| format!("已跳过未进入会话索引的异常文件：{failure}")),
+    );
+    let mut seen = HashSet::new();
+    scan_failures.retain(|failure| seen.insert(failure.clone()));
+    seen.clear();
+    warnings.retain(|warning| seen.insert(warning.clone()));
+
+    Ok(ProviderSyncScan {
+        active_sqlite,
+        sqlite,
+        rollouts,
+        catalog,
+        scan_failures,
+        warnings,
+    })
+}
+
 pub(crate) fn session_sync_status_inner(
     config_dir: Option<String>,
-    _target_provider: Option<String>,
+    target_provider: Option<String>,
 ) -> Result<SessionSyncStatus> {
     let codex_dir = resolve_codex_dir(config_dir)?;
-    let target = SHARED_SESSION_PROVIDER.to_string();
+    let target = current_model_provider(&codex_dir, target_provider)?;
     let discovery = discover_sqlite_databases(&codex_dir);
     session_sync_status_with_discovery(&codex_dir, target, &discovery)
 }
 
 pub(super) fn session_sync_status_with_discovery(
     codex_dir: &Path,
-    _target: String,
+    target: String,
     discovery: &SqliteDiscovery,
 ) -> Result<SessionSyncStatus> {
-    let target = SHARED_SESSION_PROVIDER.to_string();
-    let mut scan_failures = Vec::new();
-    if let Some(failure) = live_route_failure(codex_dir) {
-        scan_failures.push(failure);
-    }
-    scan_failures.extend(discovery.active_scan_failures.iter().cloned());
-    let sqlite =
-        match scan_sqlite_with_paths(&discovery.active_paths, &RolloutScan::default(), &target) {
-            Ok(sqlite) => sqlite,
-            Err(error) => {
-                scan_failures.push(format!("无法扫描当前活动会话数据库: {error}"));
-                Default::default()
-            }
-        };
-    scan_failures.extend(sqlite.scan_failures.iter().cloned());
-    if !discovery.active_paths.is_empty() && sqlite.sqlite_dbs != discovery.active_paths.len() {
-        scan_failures.push("当前活动会话数据库未被完整扫描。".to_string());
-    }
-    let rollouts = scan_provider_buckets(codex_dir, &target, &sqlite)?;
-    scan_failures.extend(rollouts.scan_failures.iter().cloned());
-    if discovery.active_paths.is_empty()
-        && (!discovery.thread_paths.is_empty() || rollouts.discovered_rollout_files > 0)
-    {
-        scan_failures.push(
-            "未找到当前活动会话数据库；旧数据库和单独的 JSONL 不会被当作客户端活动会话。"
-                .to_string(),
-        );
-    }
-    let session_limit = sqlite.sqlite_threads.clamp(50, 1000);
-    let (sessions, session_warnings) = match list_session_previews_with_paths(
-        &discovery.active_paths,
-        &rollouts,
+    let scan = scan_provider_sync_data(codex_dir, &target, discovery)?;
+    let display_sqlite = if scan.active_sqlite.sqlite_dbs > 0 {
+        &scan.active_sqlite
+    } else {
+        &scan.sqlite
+    };
+    let session_limit = display_sqlite.sqlite_threads.clamp(50, 1000);
+    let preview_paths = if discovery.active_paths.is_empty() {
+        discovery.active_first_session_paths()
+    } else {
+        discovery.active_paths.clone()
+    };
+    let (mut sessions, session_failures) = match list_session_previews_with_paths(
+        &preview_paths,
+        &scan.rollouts,
         &target,
         session_limit,
     ) {
         Ok(result) => result,
         Err(error) => {
-            scan_failures.push(format!("无法读取当前活动会话列表: {error}"));
-            (Vec::new(), Vec::new())
+            let mut failures = scan.scan_failures.clone();
+            failures.push(format!("无法读取当前活动会话列表: {error}"));
+            return Ok(SessionSyncStatus {
+                codex_dir: codex_dir.display().to_string(),
+                target_provider: target,
+                rollout_files: scan.rollouts.rollout_files,
+                session_meta_count: scan.rollouts.session_meta_count,
+                mismatched_rollouts: scan.rollouts.mismatched_rollouts,
+                mismatched_session_meta: scan.rollouts.mismatched_session_meta,
+                sqlite_dbs: scan.sqlite.sqlite_dbs,
+                sqlite_threads: display_sqlite.sqlite_threads,
+                top_level_threads: display_sqlite.top_level_threads,
+                subagent_threads: display_sqlite.subagent_threads,
+                mismatched_threads: scan.sqlite.mismatched_threads,
+                mismatched_sessions: 0,
+                needs_sync: false,
+                scan_complete: false,
+                scan_failures: failures,
+                backup_dir: None,
+                warnings: scan.warnings,
+                sessions: Vec::new(),
+            });
         }
     };
-    scan_failures.extend(session_warnings);
+    let mut scan_failures = scan.scan_failures;
+    scan_failures.extend(session_failures);
     let mut seen_failures = HashSet::new();
     scan_failures.retain(|failure| seen_failures.insert(failure.clone()));
-    let mut warnings = rollouts.warnings;
-    warnings.extend(sqlite.warnings);
     let scan_complete = scan_failures.is_empty();
-    let mismatched_sessions = sqlite
-        .mismatched_thread_ids
-        .union(&rollouts.mismatched_thread_ids)
-        .count();
+    let mut sqlite_mismatch_ids = scan.sqlite.mismatched_thread_ids.clone();
+    sqlite_mismatch_ids.extend(scan.catalog.mismatched_thread_ids.iter().cloned());
+    let mut mismatched_ids = sqlite_mismatch_ids.clone();
+    mismatched_ids.extend(scan.rollouts.mismatched_thread_ids.iter().cloned());
+    for session in &mut sessions {
+        if mismatched_ids.contains(&session.id) {
+            session.needs_sync = true;
+        }
+    }
+    let needs_sync = !scan.rollouts.changes.is_empty()
+        || scan.sqlite.mismatched_threads > 0
+        || scan.catalog.total_updates() > 0;
     Ok(SessionSyncStatus {
         codex_dir: codex_dir.display().to_string(),
         target_provider: target,
-        rollout_files: rollouts.rollout_files,
-        session_meta_count: rollouts.session_meta_count,
-        mismatched_rollouts: rollouts.mismatched_rollouts,
-        mismatched_session_meta: rollouts.mismatched_session_meta,
-        sqlite_dbs: sqlite.sqlite_dbs,
-        sqlite_threads: sqlite.sqlite_threads,
-        top_level_threads: sqlite.top_level_threads,
-        subagent_threads: sqlite.subagent_threads,
-        mismatched_threads: sqlite.mismatched_threads,
-        mismatched_sessions,
-        needs_sync: mismatched_sessions > 0,
+        rollout_files: scan.rollouts.rollout_files,
+        session_meta_count: scan.rollouts.session_meta_count,
+        mismatched_rollouts: scan.rollouts.mismatched_rollouts,
+        mismatched_session_meta: scan.rollouts.mismatched_session_meta,
+        sqlite_dbs: scan.sqlite.sqlite_dbs,
+        sqlite_threads: display_sqlite.sqlite_threads,
+        top_level_threads: display_sqlite.top_level_threads,
+        subagent_threads: display_sqlite.subagent_threads,
+        mismatched_threads: sqlite_mismatch_ids.len(),
+        mismatched_sessions: mismatched_ids.len(),
+        needs_sync,
         scan_complete,
         scan_failures,
         backup_dir: None,
-        warnings,
+        warnings: scan.warnings,
         sessions,
     })
 }
@@ -192,7 +297,7 @@ pub(crate) fn sync_sessions_provider_inner(
 
 pub(super) fn sync_sessions_provider_with_hook<F>(
     config_dir: Option<String>,
-    _target_provider: Option<String>,
+    target_provider: Option<String>,
     mut hook: F,
 ) -> Result<SessionSyncResult>
 where
@@ -200,30 +305,23 @@ where
 {
     let codex_dir = resolve_codex_dir(config_dir)?;
     ensure_directory(&codex_dir)?;
-    let target_provider = SHARED_SESSION_PROVIDER.to_string();
+    let target_provider = current_model_provider(&codex_dir, target_provider)?;
     let _maintenance_lock = acquire_session_maintenance_lock(&codex_dir)?;
     let discovery = discover_sqlite_databases(&codex_dir);
+    ensure_sqlite_discovery_writable(&discovery)?;
     let initial_status =
         session_sync_status_with_discovery(&codex_dir, target_provider.clone(), &discovery)?;
     if !initial_status.scan_complete {
         return Err(scan_failure_error(&initial_status.scan_failures));
     }
-    let sqlite = scan_sqlite_with_paths(
-        &discovery.active_paths,
-        &RolloutScan::default(),
-        &target_provider,
-    )?;
-    if !sqlite.scan_failures.is_empty() {
-        return Err(scan_failure_error(&sqlite.scan_failures));
+    let scan = scan_provider_sync_data(&codex_dir, &target_provider, &discovery)?;
+    if !scan.scan_failures.is_empty() {
+        return Err(scan_failure_error(&scan.scan_failures));
     }
-    let rollouts = scan_provider_buckets(&codex_dir, &target_provider, &sqlite)?;
-    if !rollouts.scan_failures.is_empty() {
-        return Err(scan_failure_error(&rollouts.scan_failures));
-    }
-    if let Some(failure) = live_route_failure(&codex_dir) {
-        return Err(CodexxError::Config(failure));
-    }
-    if rollouts.changes.is_empty() && sqlite.mismatched_threads == 0 {
+    if scan.rollouts.changes.is_empty()
+        && scan.sqlite.mismatched_threads == 0
+        && scan.catalog.total_updates() == 0
+    {
         return Ok(SessionSyncResult {
             status: initial_status,
             updated_rollouts: 0,
@@ -232,12 +330,13 @@ where
         });
     }
 
-    let changed_rollouts = rollouts
+    let changed_rollouts = scan
+        .rollouts
         .changes
         .iter()
         .map(|change| change.path.clone())
         .collect::<Vec<_>>();
-    let mut pending_sqlite = prepare_sqlite_updates(&discovery.active_paths)?;
+    let mut pending_sqlite = prepare_sqlite_updates(&discovery.related_paths)?;
     let sqlite_snapshot_paths = pending_sqlite
         .iter()
         .map(|update| update.path().to_path_buf())
@@ -256,9 +355,10 @@ where
     };
     let mut journal = MutationJournal::default();
     let mutation = execute_provider_sync_mutation(
-        &rollouts,
+        &scan.rollouts,
         &mut pending_sqlite,
         &target_provider,
+        &scan.catalog.sources,
         &mut journal,
         &mut hook,
     );
@@ -302,6 +402,8 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    const SHARED_SESSION_PROVIDER: &str = "custom";
 
     fn temp_codex_dir(label: &str) -> std::path::PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -365,6 +467,74 @@ mod tests {
         .expect("insert thread with rollout path");
     }
 
+    fn create_catalog_database(path: &Path, rows: &[(&str, &str)]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create catalog database parent");
+        }
+        let conn = Connection::open(path).expect("create catalog database");
+        conn.execute_batch(
+            "CREATE TABLE local_thread_catalog (
+                host_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                display_title TEXT NOT NULL,
+                source_created_at REAL NOT NULL,
+                source_updated_at REAL NOT NULL,
+                cwd TEXT NOT NULL,
+                source_kind TEXT NOT NULL,
+                source_detail TEXT,
+                model_provider TEXT NOT NULL,
+                git_branch TEXT,
+                observation_sequence INTEGER NOT NULL,
+                missing_candidate INTEGER NOT NULL DEFAULT 0,
+                thread_source TEXT,
+                source_recency_at REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY (host_id, thread_id)
+             );
+             CREATE TABLE local_thread_catalog_hosts (
+                host_id TEXT PRIMARY KEY,
+                host_kind TEXT NOT NULL
+             );
+             INSERT INTO local_thread_catalog_hosts VALUES ('local', 'local');
+             CREATE TABLE local_thread_catalog_metadata (
+                id INTEGER PRIMARY KEY,
+                catalog_revision INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO local_thread_catalog_metadata VALUES (1, 7);
+             CREATE TABLE local_thread_catalog_sync_state (
+                host_id TEXT PRIMARY KEY,
+                watermark_updated_at REAL,
+                initial_build_complete INTEGER NOT NULL DEFAULT 0,
+                observation_sequence INTEGER NOT NULL DEFAULT 0,
+                last_full_reconciled_at INTEGER
+             );
+             INSERT INTO local_thread_catalog_sync_state VALUES ('local', 100, 1, 0, 100);",
+        )
+        .expect("create catalog tables");
+        for (index, (id, provider)) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO local_thread_catalog (
+                    host_id, thread_id, display_title, source_created_at, source_updated_at,
+                    cwd, source_kind, source_detail, model_provider, git_branch,
+                    observation_sequence, missing_candidate, thread_source, source_recency_at
+                 ) VALUES ('local', ?1, ?1, 100, 100, '/tmp/project', 'cli', '', ?2,
+                    NULL, ?3, 0, 'user', 100)",
+                (id, provider, index as i64 + 1),
+            )
+            .expect("insert catalog row");
+        }
+    }
+
+    fn catalog_provider(path: &Path, id: &str) -> String {
+        Connection::open(path)
+            .expect("open catalog database")
+            .query_row(
+                "SELECT model_provider FROM local_thread_catalog WHERE thread_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .expect("read catalog provider")
+    }
+
     fn thread_provider(path: &Path, id: &str) -> String {
         Connection::open(path)
             .expect("open session database")
@@ -394,22 +564,76 @@ mod tests {
     }
 
     #[test]
-    fn live_provider_must_route_to_custom_before_status_can_be_complete() {
-        let codex_dir = temp_codex_dir("live-provider-gate");
-        write_config(&codex_dir, "openai");
+    fn live_provider_is_used_as_the_sync_target() {
+        let codex_dir = temp_codex_dir("live-provider-target");
+        let provider = "wujin_provider_1785657600000";
+        write_config(&codex_dir, provider);
+        let id = "019f6000-0000-7000-8000-000000000500";
+        let database = codex_dir.join("state_5.sqlite");
+        create_thread_database(&database, id, "openai");
+        let rollout = write_rollout(&codex_dir, id, "openai");
 
         let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
-            .expect("read blocked status");
-        assert!(!status.scan_complete);
-        assert!(!status.needs_sync);
-        assert!(status
-            .scan_failures
-            .iter()
-            .any(|failure| failure.contains("model_provider") && failure.contains("openai")));
+            .expect("read live provider status");
+        assert!(status.scan_complete, "{:?}", status.scan_failures);
+        assert_eq!(status.target_provider, provider);
+        assert!(status.needs_sync);
 
-        let error = sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
-            .expect_err("non-custom live route must block synchronization");
-        assert!(error.to_string().contains("未路由到共享 custom 会话"));
+        let result = sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
+            .expect("synchronize to the live provider");
+        assert_eq!(result.status.target_provider, provider);
+        assert!(!result.status.needs_sync);
+        assert_eq!(thread_provider(&database, id), provider);
+        assert!(fs::read_to_string(rollout)
+            .expect("read synchronized rollout")
+            .contains(&format!("\"model_provider\":\"{provider}\"")));
+
+        fs::remove_dir_all(codex_dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn explicit_target_overrides_config_without_rewriting_it() {
+        let codex_dir = temp_codex_dir("explicit-provider-target");
+        write_config(&codex_dir, "configured-provider");
+        let original_config = fs::read(codex_dir.join("config.toml")).expect("read config");
+        let id = "019f6000-0000-7000-8000-000000000501";
+        let database = codex_dir.join("state_5.sqlite");
+        create_thread_database(&database, id, "openai");
+        let rollout = write_rollout(&codex_dir, id, "openai");
+
+        let result = sync_sessions_provider_inner(
+            Some(codex_dir.display().to_string()),
+            Some("manual-provider".to_string()),
+        )
+        .expect("synchronize to explicit target");
+        assert_eq!(result.status.target_provider, "manual-provider");
+        assert_eq!(thread_provider(&database, id), "manual-provider");
+        assert!(fs::read_to_string(rollout)
+            .expect("read synchronized rollout")
+            .contains("\"model_provider\":\"manual-provider\""));
+        assert_eq!(
+            fs::read(codex_dir.join("config.toml")).expect("read unchanged config"),
+            original_config
+        );
+
+        fs::remove_dir_all(codex_dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn missing_config_defaults_to_openai() {
+        let codex_dir = temp_codex_dir("default-provider-target");
+        let id = "019f6000-0000-7000-8000-000000000502";
+        let database = codex_dir.join("state_5.sqlite");
+        create_thread_database(&database, id, "custom");
+
+        let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
+            .expect("read default provider status");
+        assert_eq!(status.target_provider, "openai");
+        assert!(status.needs_sync);
+        let result = sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
+            .expect("synchronize to default provider");
+        assert_eq!(result.status.target_provider, "openai");
+        assert_eq!(thread_provider(&database, id), "openai");
 
         fs::remove_dir_all(codex_dir).expect("remove test directory");
     }
@@ -460,9 +684,10 @@ mod tests {
         let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
             .expect("scan active sessions only");
         assert!(status.scan_complete, "{:?}", status.scan_failures);
-        assert_eq!(status.rollout_files, 1);
+        assert_eq!(status.rollout_files, 2);
         assert_eq!(status.session_meta_count, 1);
         assert!(!status.needs_sync);
+        assert_eq!(status.warnings.len(), 1);
 
         fs::remove_dir_all(codex_dir).expect("remove test directory");
     }
@@ -487,8 +712,9 @@ mod tests {
         let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
             .expect("scan referenced sessions only");
         assert!(status.scan_complete, "{:?}", status.scan_failures);
-        assert_eq!(status.rollout_files, 1);
+        assert_eq!(status.rollout_files, 2);
         assert_eq!(status.session_meta_count, 1);
+        assert_eq!(status.warnings.len(), 1);
 
         fs::remove_dir_all(codex_dir).expect("remove test directory");
     }
@@ -575,8 +801,8 @@ mod tests {
         let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
             .expect("scan missing referenced rollout");
         assert!(!status.scan_complete);
-        assert!(!status.needs_sync);
-        assert_eq!(status.rollout_files, 0);
+        assert!(status.needs_sync);
+        assert_eq!(status.rollout_files, 1);
         assert!(status
             .scan_failures
             .iter()
@@ -622,7 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_rollout_path_excludes_other_files_with_the_same_thread_id() {
+    fn provider_sync_updates_all_rollouts_even_when_sqlite_selects_one() {
         let codex_dir = temp_codex_dir("referenced-rollout-excludes-duplicates");
         write_config(&codex_dir, SHARED_SESSION_PROVIDER);
         let id = "019f6000-0000-7000-8000-000000000508";
@@ -633,14 +859,14 @@ mod tests {
         create_thread_database_with_rollout(&database, id, "openai", &selected);
 
         let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
-            .expect("scan only the SQLite-selected rollout");
+            .expect("scan every rollout");
         assert!(status.scan_complete, "{:?}", status.scan_failures);
-        assert_eq!(status.rollout_files, 1);
-        assert_eq!(status.mismatched_rollouts, 1);
+        assert_eq!(status.rollout_files, 2);
+        assert_eq!(status.mismatched_rollouts, 2);
 
         let result = sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
-            .expect("synchronize only the SQLite-selected rollout");
-        assert_eq!(result.updated_rollouts, 1);
+            .expect("synchronize every rollout");
+        assert_eq!(result.updated_rollouts, 2);
         assert_eq!(result.updated_threads, 1);
         assert_eq!(thread_provider(&database, id), SHARED_SESSION_PROVIDER);
         assert!(fs::read_to_string(&selected)
@@ -648,7 +874,7 @@ mod tests {
             .contains("\"model_provider\":\"custom\""));
         assert!(fs::read_to_string(&duplicate)
             .expect("read duplicate rollout")
-            .contains("\"model_provider\":\"openai\""));
+            .contains("\"model_provider\":\"custom\""));
 
         fs::remove_dir_all(codex_dir).expect("remove test directory");
     }
@@ -709,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_sqlite_is_not_counted_or_modified() {
+    fn all_thread_databases_are_synchronized_without_inflating_the_active_list() {
         let codex_dir = temp_codex_dir("active-only");
         write_config(&codex_dir, SHARED_SESSION_PROVIDER);
         let active = codex_dir.join("state_5.sqlite");
@@ -722,23 +948,57 @@ mod tests {
         let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
             .expect("read active status");
         assert!(status.scan_complete);
-        assert_eq!(status.sqlite_dbs, 1);
+        assert_eq!(status.sqlite_dbs, 2);
         assert_eq!(status.sqlite_threads, 1);
-        assert_eq!(status.mismatched_threads, 1);
+        assert_eq!(status.mismatched_threads, 2);
         assert_eq!(status.sessions.len(), 1);
         assert_eq!(status.sessions[0].id, active_id);
 
         let result = sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
             .expect("sync active database");
-        assert_eq!(result.updated_threads, 1);
+        assert_eq!(result.updated_threads, 2);
         assert_eq!(thread_provider(&active, active_id), "custom");
-        assert_eq!(thread_provider(&legacy, legacy_id), "openai");
+        assert_eq!(thread_provider(&legacy, legacy_id), "custom");
 
         fs::remove_dir_all(codex_dir).expect("remove test directory");
     }
 
     #[test]
-    fn configured_sqlite_home_is_the_only_active_database_root() {
+    fn stale_legacy_rollout_reference_warns_without_blocking_active_sync() {
+        let codex_dir = temp_codex_dir("stale-legacy-rollout");
+        write_config(&codex_dir, SHARED_SESSION_PROVIDER);
+        let active_id = "019f6000-0000-7000-8000-000000000513";
+        let legacy_id = "019f6000-0000-7000-8000-000000000514";
+        let active_rollout = write_rollout(&codex_dir, active_id, "openai");
+        let active = codex_dir.join("state_5.sqlite");
+        create_thread_database_with_rollout(&active, active_id, "openai", &active_rollout);
+        let stale_rollout = codex_dir.join(format!("sessions/rollout-deleted-{legacy_id}.jsonl"));
+        let legacy = codex_dir.join("sqlite/state_5.sqlite");
+        create_thread_database_with_rollout(&legacy, legacy_id, "openai", &stale_rollout);
+
+        let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
+            .expect("scan with stale legacy reference");
+        assert!(status.scan_complete, "{:?}", status.scan_failures);
+        assert!(status.needs_sync);
+        assert!(status
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("已忽略旧会话索引异常")));
+
+        let result = sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
+            .expect("synchronize despite stale legacy reference");
+        assert_eq!(result.updated_threads, 2);
+        assert_eq!(thread_provider(&active, active_id), "custom");
+        assert_eq!(thread_provider(&legacy, legacy_id), "custom");
+        assert!(fs::read_to_string(active_rollout)
+            .expect("read active rollout")
+            .contains("\"model_provider\":\"custom\""));
+
+        fs::remove_dir_all(codex_dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn configured_sqlite_home_controls_display_while_all_databases_are_synchronized() {
         let codex_dir = temp_codex_dir("configured-sqlite-home");
         fs::write(
             codex_dir.join("config.toml"),
@@ -760,15 +1020,15 @@ mod tests {
 
         let result = sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
             .expect("sync configured active database");
-        assert_eq!(result.updated_threads, 1);
+        assert_eq!(result.updated_threads, 2);
         assert_eq!(thread_provider(&configured, configured_id), "custom");
-        assert_eq!(thread_provider(&root_copy, root_id), "openai");
+        assert_eq!(thread_provider(&root_copy, root_id), "custom");
 
         fs::remove_dir_all(codex_dir).expect("remove test directory");
     }
 
     #[test]
-    fn legacy_only_database_is_not_treated_as_active() {
+    fn legacy_only_database_can_still_be_synchronized() {
         let codex_dir = temp_codex_dir("legacy-only");
         write_config(&codex_dir, SHARED_SESSION_PROVIDER);
         let legacy = codex_dir.join("sqlite/state_5.sqlite");
@@ -777,18 +1037,19 @@ mod tests {
 
         let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
             .expect("read legacy-only status");
-        assert!(!status.scan_complete);
-        assert_eq!(status.sqlite_threads, 0);
-        assert!(status.sessions.is_empty());
-        sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
-            .expect_err("legacy-only database must not be synchronized");
-        assert_eq!(thread_provider(&legacy, id), "openai");
+        assert!(status.scan_complete, "{:?}", status.scan_failures);
+        assert_eq!(status.sqlite_threads, 1);
+        assert_eq!(status.sessions.len(), 1);
+        let result = sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
+            .expect("synchronize legacy-only database");
+        assert_eq!(result.updated_threads, 1);
+        assert_eq!(thread_provider(&legacy, id), "custom");
 
         fs::remove_dir_all(codex_dir).expect("remove test directory");
     }
 
     #[test]
-    fn orphan_rollout_is_not_counted_or_modified() {
+    fn orphan_rollout_is_synchronized_like_codex_plusplus() {
         let codex_dir = temp_codex_dir("orphan-rollout");
         write_config(&codex_dir, SHARED_SESSION_PROVIDER);
         let active_id = "019f6000-0000-7000-8000-000000000531";
@@ -803,16 +1064,16 @@ mod tests {
         let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
             .expect("read active-only status");
         assert!(status.scan_complete);
-        assert!(!status.needs_sync);
-        assert_eq!(status.mismatched_sessions, 0);
-        assert_eq!(status.mismatched_rollouts, 0);
+        assert!(status.needs_sync);
+        assert_eq!(status.mismatched_sessions, 1);
+        assert_eq!(status.mismatched_rollouts, 1);
 
         let result = sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
-            .expect("orphan rollout does not require synchronization");
-        assert_eq!(result.updated_rollouts, 0);
+            .expect("synchronize orphan rollout");
+        assert_eq!(result.updated_rollouts, 1);
         assert!(fs::read_to_string(orphan)
             .expect("read orphan rollout")
-            .contains("\"model_provider\":\"openai\""));
+            .contains("\"model_provider\":\"custom\""));
 
         fs::remove_dir_all(codex_dir).expect("remove test directory");
     }
@@ -851,6 +1112,145 @@ mod tests {
         assert_eq!(result.updated_threads, 1);
         assert_eq!(result.updated_rollouts, 1);
         assert_eq!(result.status.mismatched_sessions, 0);
+
+        fs::remove_dir_all(codex_dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn provider_sync_updates_and_repairs_the_client_catalog() {
+        let codex_dir = temp_codex_dir("catalog-repair");
+        let provider = "wujin_provider_1785657600001";
+        write_config(&codex_dir, provider);
+        let first_id = "019f6000-0000-7000-8000-000000000551";
+        let second_id = "019f6000-0000-7000-8000-000000000552";
+        let state = codex_dir.join("state_5.sqlite");
+        create_thread_database(&state, first_id, provider);
+        let state_conn = Connection::open(&state).expect("open state database");
+        state_conn
+            .execute(
+                "INSERT INTO threads (id, model_provider, title) VALUES (?1, ?2, 'Second')",
+                (second_id, provider),
+            )
+            .expect("insert second thread");
+        state_conn
+            .execute_batch(
+                "ALTER TABLE threads ADD COLUMN updated_at_ms INTEGER;
+                 ALTER TABLE threads ADD COLUMN recency_at_ms INTEGER;
+                 UPDATE threads SET updated_at_ms = 200000, recency_at_ms = 300000;",
+            )
+            .expect("seed thread timestamps");
+        drop(state_conn);
+        let catalog = codex_dir.join("sqlite/codex-dev.db");
+        create_catalog_database(&catalog, &[(first_id, "openai")]);
+
+        let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
+            .expect("scan catalog drift");
+        assert!(status.scan_complete, "{:?}", status.scan_failures);
+        assert!(status.needs_sync);
+        assert_eq!(status.mismatched_sessions, 2);
+
+        let result = sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
+            .expect("repair client catalog");
+        assert_eq!(result.updated_threads, 2);
+        assert!(!result.status.needs_sync);
+        assert_eq!(catalog_provider(&catalog, first_id), provider);
+        assert_eq!(catalog_provider(&catalog, second_id), provider);
+        let catalog_conn = Connection::open(&catalog).expect("open repaired catalog");
+        let (revision, observation_sequence, recency): (i64, i64, f64) = catalog_conn
+            .query_row(
+                "SELECT
+                    (SELECT catalog_revision FROM local_thread_catalog_metadata WHERE id = 1),
+                    (SELECT observation_sequence FROM local_thread_catalog_sync_state WHERE host_id = 'local'),
+                    (SELECT source_recency_at FROM local_thread_catalog WHERE thread_id = ?1)",
+                [second_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read catalog metadata");
+        assert_eq!(revision, 8);
+        assert!(observation_sequence >= 2);
+        assert_eq!(recency, 300.0);
+        drop(catalog_conn);
+
+        let second = sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
+            .expect("repeat catalog synchronization");
+        assert_eq!(second.updated_rollouts, 0);
+        assert_eq!(second.updated_threads, 0);
+        assert!(second.backup_dir.is_empty());
+
+        fs::remove_dir_all(codex_dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn injected_failure_restores_catalog_rows_metadata_and_sync_state() {
+        let codex_dir = temp_codex_dir("catalog-rollback");
+        write_config(&codex_dir, SHARED_SESSION_PROVIDER);
+        let first_id = "019f6000-0000-7000-8000-000000000561";
+        let second_id = "019f6000-0000-7000-8000-000000000562";
+        let state = codex_dir.join("state_5.sqlite");
+        create_thread_database(&state, first_id, "openai");
+        Connection::open(&state)
+            .expect("open state database")
+            .execute(
+                "INSERT INTO threads (id, model_provider, title) VALUES (?1, 'openai', 'Second')",
+                [second_id],
+            )
+            .expect("insert second thread");
+        let rollout = write_rollout(&codex_dir, first_id, "openai");
+        let original_rollout = fs::read(&rollout).expect("read original rollout");
+        let catalog = codex_dir.join("sqlite/codex-dev.db");
+        create_catalog_database(&catalog, &[(first_id, "openai")]);
+
+        let error = sync_sessions_provider_with_hook(
+            Some(codex_dir.display().to_string()),
+            None,
+            |point| match point {
+                MutationPoint::AfterSqliteCommit(1) => {
+                    assert_eq!(catalog_provider(&catalog, first_id), "custom");
+                    assert_eq!(catalog_provider(&catalog, second_id), "custom");
+                    Err(CodexxError::Config("catalog rollback test".to_string()))
+                }
+                _ => Ok(()),
+            },
+        )
+        .expect_err("inject failure after catalog commit");
+        assert_eq!(error.to_string(), "配置错误: catalog rollback test");
+        assert_eq!(thread_provider(&state, first_id), "openai");
+        assert_eq!(thread_provider(&state, second_id), "openai");
+        assert_eq!(catalog_provider(&catalog, first_id), "openai");
+        let catalog_conn = Connection::open(&catalog).expect("open restored catalog");
+        let (rows, revision, watermark, sequence, reconciled): (i64, i64, f64, i64, i64) =
+            catalog_conn
+                .query_row(
+                    "SELECT
+                        (SELECT COUNT(*) FROM local_thread_catalog),
+                        (SELECT catalog_revision FROM local_thread_catalog_metadata WHERE id = 1),
+                        (SELECT watermark_updated_at FROM local_thread_catalog_sync_state WHERE host_id = 'local'),
+                        (SELECT observation_sequence FROM local_thread_catalog_sync_state WHERE host_id = 'local'),
+                        (SELECT last_full_reconciled_at FROM local_thread_catalog_sync_state WHERE host_id = 'local')",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .expect("read restored catalog state");
+        assert_eq!(
+            (rows, revision, watermark, sequence, reconciled),
+            (1, 7, 100.0, 0, 100)
+        );
+        let quick_check: String = catalog_conn
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .expect("check restored catalog");
+        assert_eq!(quick_check, "ok");
+        assert_eq!(
+            fs::read(rollout).expect("read restored rollout"),
+            original_rollout
+        );
 
         fs::remove_dir_all(codex_dir).expect("remove test directory");
     }

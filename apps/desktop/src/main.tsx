@@ -11,19 +11,16 @@ import { OverviewPage } from "./pages/OverviewPage";
 import { AboutPage, SettingsPage, TomlConfigPage } from "./pages/UtilityPages";
 import { PromptsPage } from "./pages/PromptsPage";
 import { SkillsMcpPage } from "./pages/SkillsMcpPage";
-import { SkinsPage } from "./pages/SkinsPage";
 import { ProvidersPage, type ProviderCopy, type ProviderRow } from "./pages/ProvidersPage";
 import { AppShell, type AppTab, type AppTheme } from "./components/AppShell";
 import {
   AppToast,
-  SkinRestartDialog,
   StartupWizardDialog,
   UpdateDialog,
 } from "./components/AppDialogs";
 import { PageTransition } from "./components/PageTransition";
 import { cx } from "./components/ui";
 import { appUpdater, useAppUpdater } from "./appUpdater";
-import { useSkinCenter } from "./hooks/useSkinCenter";
 import type {
   AboutInfo,
   ActionResult,
@@ -65,7 +62,6 @@ const STARTUP_WIZARD_SEEN_KEY = "codexx.startupWizardSeen";
 const ACTIVE_PROVIDER_KEY = "codexx.activeProviderId";
 const PROMPT_INJECTION_MODE_KEY = "codexx.promptInjectionMode";
 const FALLBACK_GITHUB_REPO = "yynxxxxx/Codex-X";
-const SKIN_CENTER_ENABLED = false;
 
 type ThemeTransitionDocument = Document & {
   startViewTransition?: (update: () => void | Promise<void>) => { finished: Promise<void> };
@@ -149,7 +145,6 @@ const dict = {
       provider: "供应商",
       sessions: "会话管理",
       skillsMcp: "技能和MCP",
-      skins: "皮肤中心",
       instruction: "指令提示词",
       toml: "TOML",
       settings: "设置",
@@ -251,7 +246,6 @@ const dict = {
       provider: "Provider",
       sessions: "Sessions",
       skillsMcp: "Skills & MCP",
-      skins: "Skins",
       instruction: "Prompt",
       toml: "TOML",
       settings: "Settings",
@@ -706,7 +700,6 @@ function App() {
   const t = dict[lang];
   const updater = useAppUpdater();
   const isMacRuntime = navigator.userAgent.toLowerCase().includes("mac");
-  const skinCenterEnabled = SKIN_CENTER_ENABLED;
   const [tab, setTab] = React.useState<Tab>("dashboard");
   const [visitedTabs, setVisitedTabs] = React.useState<Set<Tab>>(() => new Set(["dashboard"]));
   const [providerMode, setProviderMode] = React.useState<ProviderMode>("list");
@@ -772,32 +765,7 @@ function App() {
   const promptCatalogReadyRef = React.useRef(false);
   const promptModeSyncedRef = React.useRef("");
   const skillsMcpLoadedRef = React.useRef(false);
-  const skinShutdownAttemptedRef = React.useRef(false);
   const themeTransitionTimerRef = React.useRef<number | null>(null);
-  const {
-    state: skinCenterState,
-    restartRequest: skinRestartRequest,
-    pauseBusy: skinPauseBusy,
-    zipInputRef: skinZipImportRef,
-    imageInputRef: skinImageInputRef,
-    refresh: refreshSkinCenter,
-    importZip: importSkinThemeZip,
-    createFromImage: createSkinThemeFromImage,
-    updateSettings: updateSkinThemeSettings,
-    apply: enableSkinTheme,
-    pause: pauseSkinTheme,
-    confirmRestart: confirmSkinRestart,
-    closeRestart: closeSkinRestart,
-    exportTheme: exportSkinTheme,
-  } = useSkinCenter({
-    enabled: skinCenterEnabled,
-    lang,
-    tab,
-    ready: Boolean(state),
-    setActionBusy,
-    setError,
-    setToast,
-  });
   const providerTomlPreview = React.useMemo(() => buildProviderTomlPreview(providerForm), [providerForm]);
   const providerAuthPreview = React.useMemo(() => buildProviderAuthPreview(providerForm), [providerForm]);
   const activeBuiltinTemplateId = state?.instructionTemplateKey?.startsWith("builtin:")
@@ -936,16 +904,6 @@ function App() {
       return next;
     });
   }, [tab]);
-
-  React.useEffect(() => {
-    if (skinCenterEnabled || skinShutdownAttemptedRef.current) return;
-    skinShutdownAttemptedRef.current = true;
-    void invoke("pause_skin_theme").catch((error) => {
-      setError(lang === "zh"
-        ? `皮肤中心已暂时关闭，但未能自动停用现有皮肤：${String(error)}`
-        : `The skin center is temporarily disabled, but the active skin could not be stopped: ${String(error)}`);
-    });
-  }, [lang, skinCenterEnabled]);
 
   const currentProvider = state?.providers.find((p) => p.isCurrent);
   const liveProviderId = (state?.modelProvider || "openai").trim();
@@ -2089,7 +2047,6 @@ function App() {
     <AppShell
       activeTab={tab}
       onTabChange={(nextTab) => {
-        if (nextTab === "skins" && !skinCenterEnabled) return;
         if (!state && nextTab !== "dashboard" && nextTab !== "settings" && nextTab !== "about") {
           setTab("dashboard");
           return;
@@ -2105,7 +2062,6 @@ function App() {
       updatePhase={updater.state.phase}
       onOpenUpdate={() => setUpdatePromptOpen(true)}
       isMacRuntime={isMacRuntime}
-      skinCenterEnabled={skinCenterEnabled}
       contentClassName={cx(
         tab === "sessions" && "cx-app-content--sessions",
         (
@@ -2137,14 +2093,6 @@ function App() {
           setUpdatePromptOpen(false);
           openExternalUrl(releaseInfo.htmlUrl);
         }}
-      />
-      <SkinRestartDialog
-        open={skinCenterEnabled && Boolean(skinRestartRequest)}
-        lang={lang}
-        themeName={skinRestartRequest?.themeName}
-        busy={actionBusy.startsWith("skin:")}
-        onClose={closeSkinRestart}
-        onConfirm={confirmSkinRestart}
       />
       <StartupWizardDialog
         open={startupWizardOpen}
@@ -2361,26 +2309,6 @@ function App() {
                 onToggleSkill={toggleSkillEnabled}
                 onToggleMcp={toggleMcpEnabled}
               />
-            )}
-
-            {skinCenterEnabled && state && (tab === "skins" || visitedTabs.has("skins")) && (
-              <div className={cx("cx-skins-pane", tab !== "skins" && "page-pane-hidden")}>
-                <SkinsPage
-                  lang={lang}
-                  state={skinCenterState}
-                  actionBusy={actionBusy}
-                  pauseBusy={skinPauseBusy}
-                  zipInputRef={skinZipImportRef}
-                  imageInputRef={skinImageInputRef}
-                  onLoad={refreshSkinCenter}
-                  onImportZip={importSkinThemeZip}
-                  onCreateFromImage={createSkinThemeFromImage}
-                  onUpdateThemeSettings={updateSkinThemeSettings}
-                  onEnableTheme={enableSkinTheme}
-                  onExportTheme={exportSkinTheme}
-                  onPauseTheme={pauseSkinTheme}
-                />
-              </div>
             )}
 
             {state && tab === "instruction" && (

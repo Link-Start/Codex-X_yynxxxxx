@@ -5,7 +5,6 @@ import {
   ChevronRight,
   Edit2,
   FileText,
-  Palette,
   Plus,
   Settings2,
   Trash2,
@@ -32,7 +31,6 @@ type PromptCategoryManagerProps = {
   onRenameCategory: (categoryId: string, name: string) => boolean;
   onDeleteCategory: (categoryId: string) => boolean;
   onMovePrompt: (promptKey: string, categoryId: string) => void;
-  subject?: "prompt" | "skin";
 };
 
 export function PromptCategoryManager({
@@ -46,7 +44,6 @@ export function PromptCategoryManager({
   onRenameCategory,
   onDeleteCategory,
   onMovePrompt,
-  subject = "prompt",
 }: PromptCategoryManagerProps) {
   const isChinese = lang === "zh";
   const [expandedCategories, setExpandedCategories] = useState<Set<string>>(new Set());
@@ -75,38 +72,11 @@ export function PromptCategoryManager({
     return grouped;
   }, [categories, categoryForPrompt, prompts]);
 
-  const subjectCopy = isChinese
-    ? subject === "skin"
-      ? {
-          deleteTitle: "删除皮肤分类",
-          deleteDescription: (name: string) => `“${name}”中的皮肤会移到默认分类，皮肤本身不会被删除。`,
-          empty: "该分类下暂无皮肤",
-          move: (title: string) => `移动“${title}”到分类`,
-        }
-      : {
-          deleteTitle: "删除提示词分类",
-          deleteDescription: (name: string) => `“${name}”中的提示词会移到默认分类，提示词本身不会被删除。`,
-          empty: "该分类下暂无提示词",
-          move: (title: string) => `移动“${title}”到分类`,
-        }
-    : subject === "skin"
-      ? {
-          deleteTitle: "Delete skin category",
-          deleteDescription: (name: string) => `Skins in “${name}” will move to the default category. The skins are not deleted.`,
-          empty: "No skins in this category",
-          move: (title: string) => `Move “${title}” to category`,
-        }
-      : {
-          deleteTitle: "Delete prompt category",
-          deleteDescription: (name: string) => `Prompts in “${name}” will move to the default category. The prompts are not deleted.`,
-          empty: "No prompts in this category",
-          move: (title: string) => `Move “${title}” to category`,
-        };
   const copy = isChinese
     ? {
         title: "分类管理",
-        deleteTitle: subjectCopy.deleteTitle,
-        deleteDescription: subjectCopy.deleteDescription,
+        deleteTitle: "删除提示词分类",
+        deleteDescription: (name: string) => `“${name}”中的提示词会移到默认分类，提示词本身不会被删除。`,
         addCategory: "新增分类",
         namePlaceholder: "输入分类名称",
         cancel: "取消",
@@ -116,16 +86,16 @@ export function PromptCategoryManager({
         edit: "编辑分类",
         remove: "删除分类",
         keepOne: "至少保留一个分类",
-        empty: subjectCopy.empty,
-        move: subjectCopy.move,
+        empty: "该分类下暂无提示词",
+        move: (title: string) => `移动“${title}”到分类`,
         duplicate: `分类名称不能为空、重复或超过 ${PROMPT_CATEGORY_NAME_MAX_LENGTH} 个字符`,
         expand: (name: string) => `展开${name}`,
         collapse: (name: string) => `收起${name}`,
       }
     : {
         title: "Manage categories",
-        deleteTitle: subjectCopy.deleteTitle,
-        deleteDescription: subjectCopy.deleteDescription,
+        deleteTitle: "Delete prompt category",
+        deleteDescription: (name: string) => `Prompts in “${name}” will move to the default category. The prompts are not deleted.`,
         addCategory: "Add category",
         namePlaceholder: "Category name",
         cancel: "Cancel",
@@ -135,14 +105,12 @@ export function PromptCategoryManager({
         edit: "Edit category",
         remove: "Delete category",
         keepOne: "Keep at least one category",
-        empty: subjectCopy.empty,
-        move: subjectCopy.move,
+        empty: "No prompts in this category",
+        move: (title: string) => `Move “${title}” to category`,
         duplicate: `Category names cannot be empty, duplicated, or longer than ${PROMPT_CATEGORY_NAME_MAX_LENGTH} characters`,
         expand: (name: string) => `Expand ${name}`,
         collapse: (name: string) => `Collapse ${name}`,
       };
-  const ItemIcon = subject === "skin" ? Palette : FileText;
-
   const close = () => {
     if (categoryToDelete) {
       setCategoryToDelete(null);
@@ -292,7 +260,7 @@ export function PromptCategoryManager({
                     <div className="cx-prompt-category-prompts">
                       {categoryPrompts.length ? categoryPrompts.map((prompt) => (
                         <div className="cx-prompt-category-prompt" key={prompt.key}>
-                          <ItemIcon size={14} aria-hidden="true" />
+                          <FileText size={14} aria-hidden="true" />
                           <span title={prompt.title}>{prompt.title}</span>
                           <select
                             value={category.id}

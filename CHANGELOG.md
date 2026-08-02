@@ -2,6 +2,14 @@
 
 All notable changes to Codex-X will be documented here.
 
+## [Unreleased]
+
+## [v0.3.7] - 2026-08-02
+
+### 修复 Bug
+
+- 修复了一些 bug。
+
 ## [v0.3.6] - 2026-07-31
 
 ### 更新
