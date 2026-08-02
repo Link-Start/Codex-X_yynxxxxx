@@ -1252,6 +1252,7 @@ mod tests {
             original_rollout
         );
 
+        drop(catalog_conn);
         fs::remove_dir_all(codex_dir).expect("remove test directory");
     }
 
