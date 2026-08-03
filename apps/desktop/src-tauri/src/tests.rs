@@ -2395,6 +2395,36 @@ requires_openai_auth = false
 }
 
 #[test]
+fn save_provider_toml_rejects_placeholder_template_without_writing() {
+    let codex_dir = temp_codex_dir("reject-placeholder-provider-toml");
+    let original = "model_provider = \"openai\"\nmodel = \"official-model\"\n";
+    write_text(&config_path(&codex_dir), original).expect("write original config");
+
+    let error = save_provider_toml_config_inner(ProviderTomlInput {
+        config_dir: Some(codex_dir.display().to_string()),
+        config_text: r#"model_provider = "custom"
+model = "gpt-5.5"
+
+[model_providers.custom]
+name = "your-provider"
+base_url = "https://example.com/v1"
+wire_api = "responses"
+requires_openai_auth = false
+"#
+        .to_string(),
+        api_key: None,
+    })
+    .expect_err("placeholder TOML must be rejected");
+
+    assert!(error.to_string().contains("示例占位值"));
+    assert_eq!(
+        fs::read_to_string(config_path(&codex_dir)).expect("read unchanged config"),
+        original
+    );
+    let _ = fs::remove_dir_all(codex_dir);
+}
+
+#[test]
 fn provider_toml_activation_preserves_unrelated_live_settings() {
     let codex_dir = temp_codex_dir("provider-toml-merge");
     let current = r#"# keep-user-comment

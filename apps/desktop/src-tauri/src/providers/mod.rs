@@ -47,12 +47,12 @@ pub(crate) use store::{
 };
 pub(crate) use store::{
     consolidate_legacy_provider_duplicates_on_connection, custom_provider_id,
-    delete_provider_inner, experimental_bearer_token_from_doc, list_saved_providers_inner,
-    list_saved_providers_on_connection, matching_saved_provider_ids_for_live,
-    normalize_saved_provider, provider_template_from_document, reserved_codex_provider_id,
-    rollback_provider_store_inner, save_provider_inner, save_provider_with_rollback_inner,
-    unique_saved_provider_id_for_live, upsert_ccswitch_provider_on_connection, ProviderUpsertKind,
-    SavedProvider,
+    delete_provider_inner, experimental_bearer_token_from_doc, is_placeholder_provider,
+    list_saved_providers_inner, list_saved_providers_on_connection,
+    matching_saved_provider_ids_for_live, normalize_saved_provider,
+    provider_template_from_document, reserved_codex_provider_id, rollback_provider_store_inner,
+    save_provider_inner, save_provider_with_rollback_inner, unique_saved_provider_id_for_live,
+    upsert_ccswitch_provider_on_connection, ProviderUpsertKind, SavedProvider,
 };
 
 pub(crate) fn open_store() -> Result<Connection> {

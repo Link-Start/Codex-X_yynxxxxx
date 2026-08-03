@@ -5,11 +5,11 @@ use super::official_auth::{
     official_config_candidate, official_snapshot_path, save_official_config_snapshot,
 };
 use super::{
-    delete_provider_inner, experimental_bearer_token_from_doc, list_saved_providers_inner,
-    list_saved_providers_on_connection, matching_saved_provider_ids_for_live,
-    normalize_saved_provider, open_store, provider_template_from_document,
-    reserved_codex_provider_id, rollback_provider_store_inner, save_provider_with_rollback_inner,
-    SavedProvider,
+    delete_provider_inner, experimental_bearer_token_from_doc, is_placeholder_provider,
+    list_saved_providers_inner, list_saved_providers_on_connection,
+    matching_saved_provider_ids_for_live, normalize_saved_provider, open_store,
+    provider_template_from_document, reserved_codex_provider_id, rollback_provider_store_inner,
+    save_provider_with_rollback_inner, SavedProvider,
 };
 use crate::backups::create_backup;
 use crate::config_migration::migrate_legacy_prompt_config_locked;
@@ -625,6 +625,10 @@ fn merge_provider_toml_into_live(
                 "config.toml 缺少 [model_providers.{source_provider_id}]"
             ))
         })?;
+    let source_name = source_provider
+        .get("name")
+        .and_then(|item| item.as_str())
+        .unwrap_or_default();
     if source_provider
         .get("base_url")
         .and_then(|item| item.as_str())
@@ -632,6 +636,17 @@ fn merge_provider_toml_into_live(
     {
         return Err(CodexxError::Config(
             "供应商配置必须包含非空 base_url".to_string(),
+        ));
+    }
+    if is_placeholder_provider(
+        source_name,
+        source_provider
+            .get("base_url")
+            .and_then(|item| item.as_str())
+            .unwrap_or_default(),
+    ) {
+        return Err(CodexxError::Config(
+            "供应商名称和 base_url 不能使用示例占位值，请填写实际配置".to_string(),
         ));
     }
 
@@ -745,6 +760,11 @@ where
     }
     if model.is_empty() {
         return Err(CodexxError::Config("model 不能为空".to_string()));
+    }
+    if is_placeholder_provider(provider_name, base_url) {
+        return Err(CodexxError::Config(
+            "供应商名称和 base_url 不能使用示例占位值，请填写实际配置".to_string(),
+        ));
     }
 
     let cfg = config_path(codex_dir);
@@ -977,6 +997,25 @@ requires_openai_auth = false
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("create active provider test directory");
         path
+    }
+
+    #[test]
+    fn direct_switch_rejects_placeholder_provider_values() {
+        let codex_dir = active_provider_test_dir("placeholder", 30_000);
+        let error = switch_provider_inner(ProviderInput {
+            config_dir: Some(codex_dir.display().to_string()),
+            provider_id: Some("placeholder".to_string()),
+            provider_name: "your-provider".to_string(),
+            base_url: "https://example.com/v1".to_string(),
+            model: "gpt-5.5".to_string(),
+            api_key: None,
+            wire_api: Some("responses".to_string()),
+            requires_openai_auth: Some(false),
+        })
+        .expect_err("placeholder provider must be rejected");
+        assert!(error.to_string().contains("示例占位值"));
+        assert!(!config_path(&codex_dir).exists());
+        fs::remove_dir_all(codex_dir).expect("remove placeholder test directory");
     }
 
     fn write_active_provider_files(codex_dir: &Path, provider: &SavedProvider) -> Value {

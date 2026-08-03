@@ -113,6 +113,11 @@ fn normalized_provider_name(input: &str) -> String {
         .to_lowercase()
 }
 
+pub(crate) fn is_placeholder_provider(provider_name: &str, base_url: &str) -> bool {
+    normalized_provider_name(provider_name) == "your-provider"
+        && canonical_provider_base_url(base_url) == "https://example.com/v1"
+}
+
 fn effective_provider_api_key(provider: &SavedProvider) -> Option<String> {
     provider
         .api_key
@@ -863,6 +868,11 @@ pub(crate) fn normalize_saved_provider(provider: SavedProvider) -> Result<SavedP
     if normalized.model.is_empty() {
         return Err(CodexxError::Config("model 不能为空".to_string()));
     }
+    if is_placeholder_provider(&normalized.provider_name, &normalized.base_url) {
+        return Err(CodexxError::Config(
+            "供应商名称和 base_url 不能使用示例占位值，请填写实际配置".to_string(),
+        ));
+    }
     normalize_provider_toml(&mut normalized)?;
     Ok(normalized)
 }
@@ -1371,5 +1381,13 @@ command = "do-not-copy"
         assert!(doc.get("mcp_servers").is_none());
         assert!(!text.contains("experimental_bearer_token"));
         assert_eq!(normalized.api_key.as_deref(), Some("sk-explicit"));
+    }
+
+    #[test]
+    fn placeholder_provider_values_are_rejected() {
+        let mut item = provider("placeholder", "your-provider", None);
+        item.model = "gpt-5.5".to_string();
+        let error = normalize_saved_provider(item).expect_err("placeholder must be rejected");
+        assert!(error.to_string().contains("示例占位值"));
     }
 }

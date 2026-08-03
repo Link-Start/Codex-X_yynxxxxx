@@ -553,10 +553,11 @@ function providerIdentityKey(baseUrl?: string | null, apiKey?: string | null, pr
 }
 
 function buildProviderTomlPreview(provider: SavedProvider) {
-  const model = provider.model.trim() || "gpt-5.5";
-  const name = provider.providerName.trim() || "your-provider";
+  const model = provider.model.trim();
+  const name = provider.providerName.trim();
   const providerKey = "custom";
-  const baseUrl = provider.baseUrl.trim().replace(/\/+$/, "") || "https://example.com/v1";
+  const baseUrl = provider.baseUrl.trim().replace(/\/+$/, "");
+  if (!model || !name || !baseUrl) return "";
   const wireApi = provider.wireApi || "responses";
   return [
     `model_provider = "${tomlEscape(providerKey)}"`,
@@ -741,6 +742,7 @@ function App() {
   const [error, setError] = React.useState<string>("");
   const [providerForm, setProviderForm] = React.useState<SavedProvider>(defaultProviderForm);
   const [providerTomlDraft, setProviderTomlDraft] = React.useState("");
+  const [providerTomlDirty, setProviderTomlDirty] = React.useState(false);
   const [providerApiKeyVisible, setProviderApiKeyVisible] = React.useState(false);
   const [providerTestingId, setProviderTestingId] = React.useState("");
   const [availableProviderModels, setAvailableProviderModels] = React.useState<ProviderModel[]>([]);
@@ -876,6 +878,11 @@ function App() {
     if (providerMode !== "form") return;
     fitCodeEditorHeight(providerTomlEditorRef.current, 560);
   }, [providerMode, providerTomlDraft]);
+
+  React.useEffect(() => {
+    if (providerMode !== "form" || providerTomlDirty) return;
+    setProviderTomlDraft(providerTomlPreview);
+  }, [providerMode, providerTomlDirty, providerTomlPreview]);
 
   React.useEffect(() => {
     if (providerMode !== "official") return;
@@ -1440,12 +1447,18 @@ function App() {
     });
   };
 
-  const saveProviderOnly = () =>
-    call(
+  const saveProviderOnly = () => {
+    const provider = normalizedProviderForm();
+    if (!provider.providerName || !provider.baseUrl || !provider.model) {
+      setError(lang === "zh"
+        ? "请填写供应商名称、API 请求地址和模型"
+        : "Provider name, API URL, and model are required");
+      return;
+    }
+    return call(
       async () => {
         const applyAfterSave = editingDetectedProvider
           || Boolean(editingProviderId && editingProviderId === effectiveActiveProviderId);
-        const provider = normalizedProviderForm();
         const applied = applyAfterSave
           ? await invoke<ActionResult>("save_active_provider", { provider, configDir: configDir || null })
           : null;
@@ -1459,11 +1472,13 @@ function App() {
         setProviderMode("list");
         setEditingProviderId(null);
         setEditingDetectedProvider(false);
+        setProviderTomlDirty(false);
         setToast(applied
           ? (lang === "zh" ? "供应商配置已保存并热更新" : "Provider saved and hot-applied")
           : (lang === "zh" ? "供应商配置已保存" : "Provider saved"));
       },
     );
+  };
 
   const switchProvider = (provider: SavedProvider) =>
     call(
@@ -1876,6 +1891,7 @@ function App() {
     setEditingDetectedProvider(false);
     setProviderForm(next);
     setProviderTomlDraft(buildProviderTomlPreview(next));
+    setProviderTomlDirty(false);
     setProviderMode("form");
   };
 
@@ -1885,6 +1901,7 @@ function App() {
     setEditingDetectedProvider(false);
     setProviderForm(provider);
     setProviderTomlDraft(provider.tomlConfig?.trim() || buildProviderTomlPreview(provider));
+    setProviderTomlDirty(Boolean(provider.tomlConfig?.trim()));
     setProviderMode("form");
   };
 
@@ -1908,6 +1925,7 @@ function App() {
     };
     setProviderForm(next);
     setProviderTomlDraft(buildProviderTomlPreview(next));
+    setProviderTomlDirty(false);
     setProviderMode("form");
   };
 
@@ -2211,6 +2229,7 @@ function App() {
                 onCancelMode={() => {
                   setProviderMode("list");
                   setEditingDetectedProvider(false);
+                  setProviderTomlDirty(false);
                 }}
                 onOfficialModelChange={(value) => setOfficialForm((current) => ({ ...current, model: value }))}
                 onOfficialAuthChange={(value) => setOfficialForm((current) => ({ ...current, authJson: value }))}
@@ -2233,8 +2252,14 @@ function App() {
                 onWireApiChange={(value) => setProviderForm((current) => ({ ...current, wireApi: value }))}
                 onRequiresAuthChange={(value) => setProviderForm((current) => ({ ...current, requiresOpenaiAuth: value }))}
                 onToggleApiKeyVisibility={() => setProviderApiKeyVisible((value) => !value)}
-                onProviderTomlDraftChange={setProviderTomlDraft}
-                onResetProviderToml={() => setProviderTomlDraft(providerTomlPreview)}
+                onProviderTomlDraftChange={(value) => {
+                  setProviderTomlDraft(value);
+                  setProviderTomlDirty(true);
+                }}
+                onResetProviderToml={() => {
+                  setProviderTomlDraft(providerTomlPreview);
+                  setProviderTomlDirty(false);
+                }}
                 onSaveProvider={saveProviderConfig}
               />
             )}
