@@ -238,6 +238,12 @@ pub(crate) fn sanitize_id(input: &str) -> String {
 }
 
 fn default_codex_dir() -> Result<PathBuf> {
+    // Explicit app-only override for isolated native validation and portable setups.
+    if let Ok(value) = std::env::var("CODEXX_CONFIG_DIR") {
+        if let Some(path) = codex_dir_from_text(&value)? {
+            return Ok(path);
+        }
+    }
     if let Ok(value) = std::env::var("CODEX_HOME") {
         if let Some(path) = codex_dir_from_text(&value)? {
             return Ok(path);
@@ -938,6 +944,25 @@ async fn list_saved_providers() -> Result<Vec<SavedProvider>> {
         .map_err(|e| CodexxError::Config(format!("读取供应商列表失败: {e}")))?
 }
 
+#[tauri::command]
+async fn get_provider_order(config_dir: Option<String>) -> Result<Vec<String>> {
+    tauri::async_runtime::spawn_blocking(move || providers::get_provider_order_inner(config_dir))
+        .await
+        .map_err(|error| CodexxError::Config(format!("读取供应商排序失败: {error}")))?
+}
+
+#[tauri::command]
+async fn save_provider_order(
+    config_dir: Option<String>,
+    order: Vec<String>,
+) -> Result<Vec<String>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        providers::save_provider_order_inner(config_dir, order)
+    })
+    .await
+    .map_err(|error| CodexxError::Config(format!("保存供应商排序失败: {error}")))?
+}
+
 enum ActiveProviderSelectionUpdate {
     Set(String),
     ClearIfOfficial,
@@ -1146,6 +1171,24 @@ async fn delete_saved_provider(id: String, config_dir: Option<String>) -> Result
     })
     .await
     .map_err(|e| CodexxError::Config(format!("删除供应商失败: {e}")))?
+}
+
+#[tauri::command]
+async fn repair_provider_model_catalog(
+    config_dir: Option<String>,
+) -> Result<providers::model_catalog::ProviderModelCatalogRepairResult> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let codex_dir = resolve_codex_dir(config_dir)?;
+        let changed = providers::model_catalog::upgrade_owned_model_catalog(&codex_dir)?;
+        Ok(providers::model_catalog::ProviderModelCatalogRepairResult {
+            changed,
+            message: changed.then(|| {
+                "已修复供应商模型菜单的图片输入和思考强度，请重启 Codex 后使用".to_string()
+            }),
+        })
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("修复供应商模型菜单失败: {e}")))?
 }
 
 #[tauri::command]
@@ -1802,6 +1845,8 @@ pub fn run() {
             delete_saved_prompt,
             enable_saved_prompt,
             list_saved_providers,
+            get_provider_order,
+            save_provider_order,
             get_provider_config_base,
             build_provider_toml_draft,
             save_provider,
@@ -1815,6 +1860,7 @@ pub fn run() {
             activate_saved_provider,
             delete_saved_provider,
             get_codex_state,
+            repair_provider_model_catalog,
             switch_official_provider,
             list_official_profiles,
             get_official_profile,

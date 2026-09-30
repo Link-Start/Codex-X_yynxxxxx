@@ -4,6 +4,10 @@
 
 use crate::error::{CodexxError, Result};
 use crate::file_io::{ensure_directory, io_err, write_private_json};
+use crate::live_config::{
+    acquire_live_config_lock, atomic_write_if_unchanged, ensure_file_snapshot_unchanged,
+    read_file_snapshot, text_from_snapshot,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -35,6 +39,13 @@ pub(crate) struct ProviderModelMapping {
     pub(crate) display_name: String,
     #[serde(default)]
     pub(crate) context_window: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProviderModelCatalogRepairResult {
+    pub(crate) changed: bool,
+    pub(crate) message: Option<String>,
 }
 
 fn validate_name(name: &str, label: &str) -> Result<String> {
@@ -111,8 +122,9 @@ fn model_entry(mapping: &ProviderModelMapping, priority: usize, default_context:
     // Schema: openai/codex rust-v0.153.4, protocol/src/openai_models.rs,
     // ModelInfo + ModelsResponse. Keep legacy required fields for older Codex.
     // Unlike cloning a GPT cache entry, this does not import proprietary model
-    // instructions, hosted tools, service tiers or vision. Expose the same effort
-    // menu for mapped models; the upstream API determines each effort's effect.
+    // instructions, hosted tools or service tiers. Allow image attachments instead
+    // of making the client reject every third-party model before contacting its
+    // provider. The provider determines the supported modalities and efforts.
     json!({
         "slug": mapping.model,
         "display_name": mapping.display_name,
@@ -142,7 +154,7 @@ fn model_entry(mapping: &ProviderModelMapping, priority: usize, default_context:
         "max_context_window": context_window,
         "effective_context_window_percent": 95,
         "experimental_supported_tools": [],
-        "input_modalities": ["text"],
+        "input_modalities": ["text", "image"],
         "supports_search_tool": false,
         "use_responses_lite": false,
         "prefer_websockets": false
@@ -344,6 +356,15 @@ pub(crate) fn prepare_model_catalog(
         "source": "codex-x", "format": 1,
         "provider_hash": format!("{:x}", Sha256::digest(provider_id.as_bytes()))
     });
+    let path = persist_owned_catalog(codex_dir, &catalog)?;
+    // Change the caller's document only after a complete catalog is available.
+    // The caller owns the live config transaction; no auth/config files are
+    // read or written here, and models_cache.json is intentionally untouched.
+    doc[CATALOG_FIELD] = value(path.to_string_lossy().to_string());
+    Ok(())
+}
+
+fn persist_owned_catalog(codex_dir: &Path, catalog: &Value) -> Result<PathBuf> {
     let filename = catalog_filename(&catalog)?;
     let directory = prepare_owned_directory(codex_dir)?;
     let path = directory.join(filename);
@@ -355,22 +376,101 @@ pub(crate) fn prepare_model_catalog(
                 ));
             }
             let existing = fs::read(&path).map_err(|error| io_err(&path, error))?;
-            if serde_json::from_slice::<Value>(&existing).ok().as_ref() != Some(&catalog) {
+            if serde_json::from_slice::<Value>(&existing).ok().as_ref() != Some(catalog) {
                 return Err(CodexxError::Config(
                     "已生成的模型目录文件被修改，未覆盖原文件".into(),
                 ));
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            write_private_json(&path, &catalog)?
+            write_private_json(&path, catalog)?
         }
         Err(error) => return Err(io_err(&path, error)),
     }
-    // Change the caller's document only after a complete catalog is available.
-    // The caller owns the live config transaction; no auth/config files are
-    // read or written here, and models_cache.json is intentionally untouched.
+    Ok(path)
+}
+
+/// Upgrade a verified Codex-X catalog already selected by an older app. Keep
+/// the old immutable file available for backups and failed provider switches.
+/// User catalogs, edited generated files and official configurations are skipped.
+pub(crate) fn upgrade_owned_model_catalog(codex_dir: &Path) -> Result<bool> {
+    let cfg = crate::config_path(codex_dir);
+    let original = read_file_snapshot(&cfg)?;
+    let text = text_from_snapshot(&cfg, original.as_deref())?;
+    if text.trim().is_empty() {
+        return Ok(false);
+    }
+    let mut doc = crate::file_io::parse_toml_document(&cfg, &text)?;
+    if super::document_is_official(&doc) {
+        return Ok(false);
+    }
+    let Some(pointer) = doc.get(CATALOG_FIELD).and_then(|item| item.as_str()) else {
+        return Ok(false);
+    };
+    if !is_owned_pointer(codex_dir, pointer) {
+        return Ok(false);
+    }
+    let pointer = Path::new(pointer);
+    let source = if pointer.is_absolute() {
+        pointer.to_path_buf()
+    } else {
+        codex_dir.join(pointer)
+    };
+    let Some(filename) = source.file_name().and_then(|name| name.to_str()) else {
+        return Ok(false);
+    };
+    // Ownership is stronger than the path-only recognition used for removing
+    // stale pointers: only a digest-verified generated catalog may be upgraded.
+    if !has_verified_ownership(&source, filename) {
+        return Ok(false);
+    }
+    let bytes = fs::read(&source).map_err(|error| io_err(&source, error))?;
+    let mut catalog: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| CodexxError::Config("供应商模型目录不是有效的 JSON".into()))?;
+    // Recheck the read snapshot rather than trusting the first verification,
+    // since a user or another process can edit the source between reads.
+    if catalog_filename(&catalog)? != filename {
+        return Ok(false);
+    }
+    let before = catalog.clone();
+    let capabilities = model_entry(
+        &ProviderModelMapping {
+            model: String::new(),
+            display_name: String::new(),
+            context_window: None,
+        },
+        0,
+        DEFAULT_CONTEXT_WINDOW,
+    );
+    for model in catalog["models"]
+        .as_array_mut()
+        .expect("verified catalogs contain a models array")
+    {
+        if !model.is_object() {
+            return Ok(false);
+        }
+        for key in [
+            "input_modalities",
+            "default_reasoning_level",
+            "supported_reasoning_levels",
+            "supports_reasoning_summaries",
+            "supports_reasoning_summary_parameter",
+            "default_reasoning_summary",
+        ] {
+            model[key] = capabilities[key].clone();
+        }
+    }
+    if catalog == before {
+        return Ok(false);
+    }
+    let _lock = acquire_live_config_lock(codex_dir)?;
+    ensure_file_snapshot_unchanged(&cfg, original.as_deref())?;
+    ensure_file_snapshot_unchanged(&source, Some(&bytes))?;
+    let path = persist_owned_catalog(codex_dir, &catalog)?;
     doc[CATALOG_FIELD] = value(path.to_string_lossy().to_string());
-    Ok(())
+    crate::backups::create_backup(codex_dir, "upgrade-provider-model-capabilities")?;
+    atomic_write_if_unchanged(&cfg, original.as_deref(), doc.to_string().as_bytes())?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -418,6 +518,7 @@ mod tests {
             "deepseek-v4-pro",
             "vendor/custom-model",
             "gpt-5.5",
+            "gpt-6-astra",
         ] {
             let entry = model_entry(&mapping(id, id, None), 0, 128000);
             let levels: Vec<_> = entry["supported_reasoning_levels"]
@@ -537,7 +638,7 @@ mod tests {
         assert_eq!(model["display_name"], "DeepSeek 常用");
         assert_eq!(model["context_window"], 131072);
         assert_eq!(model["apply_patch_tool_type"], Value::Null);
-        assert_eq!(model["input_modalities"], json!(["text"]));
+        assert_eq!(model["input_modalities"], json!(["text", "image"]));
         assert!(!catalog.to_string().contains("gpt-5.5"));
         assert!(!catalog.to_string().contains("PRIVATE"));
         assert!(!catalog.to_string().contains("namespace-secret"));
@@ -603,6 +704,148 @@ mod tests {
             fs::read_to_string(generated).unwrap(),
             "keep this changed file"
         );
+    }
+
+    fn legacy_catalog(fixture: &Fixture, doc: &mut DocumentMut) -> (PathBuf, Vec<u8>) {
+        prepare_model_catalog(
+            &fixture.0,
+            "provider",
+            &[
+                mapping("deepseek-flash", "DeepSeek Flash", Some(131072)),
+                mapping("gpt-6-astra", "GPT-6 Astra", Some(1_000_000)),
+            ],
+            "deepseek-flash",
+            doc,
+        )
+        .unwrap();
+        let mut legacy = catalog(doc);
+        for model in legacy["models"].as_array_mut().unwrap() {
+            model["input_modalities"] = json!(["text"]);
+            model["supported_reasoning_levels"] = json!([
+                {"effort": "low", "description": "Low effort"},
+                {"effort": "max", "description": "Maximum effort"}
+            ]);
+            model["supports_reasoning_summaries"] = json!(false);
+        }
+        let filename = catalog_filename(&legacy).unwrap();
+        let path = owned_catalog_directory(&fixture.0).join(filename);
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        doc[CATALOG_FIELD] = value(path.to_string_lossy().to_string());
+        (path, bytes)
+    }
+
+    #[test]
+    fn upgrades_active_legacy_capabilities_without_touching_credentials_or_old_catalog() {
+        let fixture = Fixture::new();
+        let mut doc: DocumentMut = r#"# Keep this comment.
+model_provider = "custom"
+model = "deepseek-flash"
+model_reasoning_effort = "ultra"
+approval_policy = "never"
+[model_providers.custom]
+name = "DeepSeek"
+base_url = "https://fixture.invalid/v1"
+wire_api = "responses"
+"#
+        .parse()
+        .unwrap();
+        let (old_path, old_bytes) = legacy_catalog(&fixture, &mut doc);
+        fs::write(fixture.0.join("config.toml"), doc.to_string()).unwrap();
+        fs::write(fixture.0.join("auth.json"), "untouched-fixture-credential").unwrap();
+        fs::write(fixture.0.join("models_cache.json"), "untouched-model-cache").unwrap();
+
+        assert!(upgrade_owned_model_catalog(&fixture.0).unwrap());
+        let updated: DocumentMut = fs::read_to_string(fixture.0.join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_ne!(path(&updated), old_path);
+        assert_eq!(fs::read(old_path).unwrap(), old_bytes);
+        assert_eq!(updated["model"].as_str(), Some("deepseek-flash"));
+        assert_eq!(updated["model_reasoning_effort"].as_str(), Some("ultra"));
+        assert_eq!(updated["approval_policy"].as_str(), Some("never"));
+        assert!(updated.to_string().contains("# Keep this comment."));
+        assert_eq!(
+            updated["model_providers"]["custom"]["base_url"].as_str(),
+            Some("https://fixture.invalid/v1")
+        );
+        let upgraded = catalog(&updated);
+        assert_eq!(upgraded["models"][0]["slug"], "deepseek-flash");
+        assert_eq!(upgraded["models"][1]["slug"], "gpt-6-astra");
+        assert_eq!(upgraded["models"][0]["context_window"], 131072);
+        assert_eq!(upgraded["models"][1]["context_window"], 1_000_000);
+        for model in upgraded["models"].as_array().unwrap() {
+            assert_eq!(model["input_modalities"], json!(["text", "image"]));
+            assert_eq!(model["supports_reasoning_summaries"], true);
+            assert_eq!(
+                model["supported_reasoning_levels"]
+                    .as_array()
+                    .unwrap()
+                    .last()
+                    .unwrap()["effort"],
+                "ultra"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(fixture.0.join("auth.json")).unwrap(),
+            "untouched-fixture-credential"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.0.join("models_cache.json")).unwrap(),
+            "untouched-model-cache"
+        );
+        let config_after = fs::read(fixture.0.join("config.toml")).unwrap();
+        assert!(!upgrade_owned_model_catalog(&fixture.0).unwrap());
+        assert_eq!(
+            fs::read(fixture.0.join("config.toml")).unwrap(),
+            config_after
+        );
+    }
+
+    #[test]
+    fn capability_upgrade_skips_official_and_unverified_catalogs() {
+        let fixture = Fixture::new();
+        let mut doc: DocumentMut = "model_provider = 'custom'\nmodel = 'deepseek-flash'"
+            .parse()
+            .unwrap();
+        let (old_path, old_bytes) = legacy_catalog(&fixture, &mut doc);
+        for provider in ["openai", "custom"] {
+            doc["model_provider"] = value(provider);
+            let config = doc.to_string();
+            fs::write(fixture.0.join("config.toml"), &config).unwrap();
+            if provider == "custom" {
+                let mut modified: Value = serde_json::from_slice(&old_bytes).unwrap();
+                modified["models"][0]["display_name"] = json!("User's own menu");
+                fs::write(&old_path, serde_json::to_vec(&modified).unwrap()).unwrap();
+            }
+            assert!(!upgrade_owned_model_catalog(&fixture.0).unwrap());
+            assert_eq!(
+                fs::read_to_string(fixture.0.join("config.toml")).unwrap(),
+                config
+            );
+        }
+        doc[CATALOG_FIELD] = value("my-models.json");
+        let config = doc.to_string();
+        fs::write(fixture.0.join("config.toml"), &config).unwrap();
+        fs::write(fixture.0.join("my-models.json"), &old_bytes).unwrap();
+        assert!(!upgrade_owned_model_catalog(&fixture.0).unwrap());
+        assert_eq!(
+            fs::read_to_string(fixture.0.join("config.toml")).unwrap(),
+            config
+        );
+        assert_eq!(
+            fs::read(fixture.0.join("my-models.json")).unwrap(),
+            old_bytes
+        );
+    }
+
+    #[test]
+    fn missing_config_upgrade_does_not_create_a_codex_home() {
+        let fixture = Fixture::new();
+        let missing = fixture.0.join("missing-codex-home");
+        assert!(!upgrade_owned_model_catalog(&missing).unwrap());
+        assert!(!missing.exists());
     }
 
     #[test]

@@ -200,7 +200,7 @@
   min-width: 0;
   min-height: 78px;
   display: grid;
-  grid-template-columns: 42px minmax(0, 1fr) auto;
+  grid-template-columns: 18px 42px minmax(0, 1fr) auto;
   align-items: center;
   gap: 14px;
   padding: 14px 16px;
@@ -225,8 +225,22 @@
 /* Give official account emails their own centered column. Current-state
    badges can change the actions without moving the email in any row. */
 .cx-providers-row--official {
-  grid-template-columns: 42px minmax(0, 1fr) minmax(200px, 300px) minmax(310px, 1fr);
+  grid-template-columns: 18px 42px minmax(0, 1fr) minmax(200px, 300px) minmax(310px, 1fr);
 }
+
+.cx-providers-sort-hint { margin: -7px 1px 12px; color: var(--cx-provider-muted); font-size: 11px; line-height: 1.5; }
+.cx-providers-drag-handle { display: grid; place-items: center; width: 22px; height: 34px; margin-left: -2px; padding: 0; border: 0; border-radius: 5px; background: transparent; color: var(--cx-provider-muted); cursor: grab; touch-action: none; user-select: none; }
+.cx-providers-drag-handle:hover:not(:disabled) { background: var(--cx-provider-blue-soft); color: var(--cx-provider-blue); }
+.cx-providers-drag-handle:active { cursor: grabbing; }
+.cx-providers-drag-handle:focus-visible { outline: 2px solid var(--cx-provider-blue); outline-offset: 2px; }
+.cx-providers-drag-handle:disabled { opacity: .35; cursor: default; }
+.cx-providers-row--dragging { opacity: .45; }
+.cx-providers-row--drop-before { box-shadow: inset 0 3px 0 var(--cx-provider-blue); }
+.cx-providers-row--drop-after { box-shadow: inset 0 -3px 0 var(--cx-provider-blue); }
+.cx-providers-row-model { display: flex; align-items: baseline; gap: 6px; margin-top: 5px; min-width: 0; font-size: 11px; line-height: 1.5; }
+.cx-providers-row-model>span { flex-shrink: 0; color: var(--cx-provider-muted); }
+.cx-providers-row-model>b { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--cx-provider-text); }
+.cx-providers-row-model>code { margin: 0; flex: 0 1 auto; }
 
 .cx-providers-row--official > .cx-providers-login-badge {
   width: 100%;
@@ -915,17 +929,17 @@
 @media (max-width: 760px) {
   .cx-providers-row,
   .cx-providers-row--official {
-    grid-template-columns: 40px minmax(0, 1fr);
+    grid-template-columns: 18px 40px minmax(0, 1fr);
   }
 
   .cx-providers-row--official > .cx-providers-login-badge {
-    grid-column: 2;
+    grid-column: 3;
     width: min(300px, 100%);
     justify-self: start;
   }
 
   .cx-providers-row-actions {
-    grid-column: 2;
+    grid-column: 3;
     justify-content: flex-start;
   }
 

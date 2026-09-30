@@ -12,6 +12,7 @@ import {
   EyeOff,
   FilePlus2,
   Gauge,
+  GripVertical,
   Loader2,
   PencilLine,
   Plus,
@@ -28,6 +29,7 @@ import { ProviderPresetPicker } from "../components/ProviderPresetPicker";
 import { PROVIDER_PRESETS, getProviderPreset, getProviderPresetVariant } from "../providerPresets";
 import { Button, Checkbox, ModalShell } from "../components/ui";
 import type { ProviderMode, ProviderModelMapping } from "../types";
+import { moveProviderRow, providerRowKey } from "../providerRowOrder";
 import "../styles/providers-page.css";
 
 export type ProviderRowSource = "official" | "local" | "detected";
@@ -38,6 +40,7 @@ export type ProviderRow = {
   providerName: string;
   baseUrl: string;
   model: string;
+  modelDisplayName?: string;
   apiKey?: string;
   wireApi: string;
   requiresOpenaiAuth: boolean;
@@ -149,6 +152,8 @@ export type ProvidersPageProps = {
   loading: boolean;
   testingId: string;
   actionBusy?: string;
+  orderBusy?: boolean;
+  onReorderProviders: (order: string[]) => Promise<boolean>;
   editingProviderId: string | null;
   creatingProvider: boolean;
   selectedPresetId: string;
@@ -394,6 +399,7 @@ function ListPage({
   loading,
   testingId,
   actionBusy,
+  orderBusy,
   onImportCcSwitch,
   onAddProvider,
   onEnableProvider,
@@ -401,11 +407,76 @@ function ListPage({
   onEditProvider,
   onDuplicateProvider,
   onDeleteProvider,
-}: Pick<ProvidersPageProps, "lang" | "configDir" | "copy" | "providerRows" | "loading" | "testingId" | "actionBusy" | "onImportCcSwitch" | "onAddProvider" | "onEnableProvider" | "onTestProvider" | "onEditProvider" | "onDuplicateProvider" | "onDeleteProvider">) {
+  onReorderProviders,
+}: Pick<ProvidersPageProps, "lang" | "configDir" | "copy" | "providerRows" | "loading" | "testingId" | "actionBusy" | "orderBusy" | "onReorderProviders" | "onImportCcSwitch" | "onAddProvider" | "onEnableProvider" | "onTestProvider" | "onEditProvider" | "onDuplicateProvider" | "onDeleteProvider">) {
   const [providerToDelete, setProviderToDelete] = useState<ProviderRow | null>(null);
   const [quotaSelection, setQuotaSelection] = useState<{ id: string; configDir: string; email: string | null } | null>(null);
   const [deleting, setDeleting] = useState(false);
   const providerActionsBusy = loading || Boolean(actionBusy);
+  const sortingDisabled = providerActionsBusy || Boolean(orderBusy) || providerRows.length < 2;
+  const listRef = useRef<HTMLDivElement>(null);
+  const pointerDragRef = useRef<{ key: string; pointerId: number; startY: number; moved: boolean } | null>(null);
+  const pointerPositionRef = useRef({ x: 0, y: 0 });
+  const scrollFrameRef = useRef<number | null>(null);
+  const dropTargetRef = useRef<{ key: string; position: "before" | "after" } | null>(null);
+  const [draggedKey, setDraggedKey] = useState("");
+  const [dropTarget, setDropTarget] = useState<{ key: string; position: "before" | "after" } | null>(null);
+  const finishDrag = () => {
+    if (scrollFrameRef.current !== null) cancelAnimationFrame(scrollFrameRef.current);
+    scrollFrameRef.current = null;
+    pointerDragRef.current = null;
+    dropTargetRef.current = null;
+    setDraggedKey("");
+    setDropTarget(null);
+  };
+  useEffect(() => { finishDrag(); }, [configDir]);
+  useEffect(() => () => { if (scrollFrameRef.current !== null) cancelAnimationFrame(scrollFrameRef.current); }, []);
+  const reorder = async (source: string, target: string, position: "before" | "after") => {
+    const current = providerRows.map(providerRowKey);
+    const next = moveProviderRow(current, source, target, position);
+    if (next.some((key, index) => key !== current[index])) {
+      await onReorderProviders(next);
+      if (document.activeElement === document.body || document.activeElement?.classList.contains("cx-providers-drag-handle")) {
+        const card = Array.from(listRef.current?.querySelectorAll<HTMLElement>("[data-provider-key]") || []).find((item) => item.dataset.providerKey === source);
+        card?.querySelector<HTMLButtonElement>(".cx-providers-drag-handle")?.focus();
+      }
+    }
+  };
+  const updateDropTarget = (clientX: number, clientY: number) => {
+    const list = listRef.current;
+    if (!list) return;
+    const bounds = list.getBoundingClientRect();
+    if (clientX < bounds.left || clientX > bounds.right) {
+      dropTargetRef.current = null;
+      setDropTarget(null);
+      return;
+    }
+    const cards = Array.from(list.querySelectorAll<HTMLElement>("[data-provider-key]"));
+    const card = cards.find((item) => clientY < item.getBoundingClientRect().bottom) || cards[cards.length - 1];
+    if (!card) return;
+    const rect = card.getBoundingClientRect();
+    const target = { key: card.dataset.providerKey!, position: clientY < rect.top + rect.height / 2 ? "before" as const : "after" as const };
+    dropTargetRef.current = target;
+    setDropTarget(target);
+  };
+  const startAutoScroll = () => {
+    if (scrollFrameRef.current !== null) return;
+    const tick = () => {
+      const list = listRef.current;
+      if (!pointerDragRef.current?.moved || !list) { scrollFrameRef.current = null; return; }
+      const { x, y } = pointerPositionRef.current;
+      const bounds = list.getBoundingClientRect();
+      if (x >= bounds.left && x <= bounds.right) {
+        const speed = y < bounds.top + 48 ? -Math.min(16, (bounds.top + 48 - y) / 3)
+          : y > bounds.bottom - 48 ? Math.min(16, (y - bounds.bottom + 48) / 3) : 0;
+        const previous = list.scrollTop;
+        list.scrollTop += speed;
+        if (list.scrollTop !== previous) updateDropTarget(x, y);
+      }
+      scrollFrameRef.current = requestAnimationFrame(tick);
+    };
+    scrollFrameRef.current = requestAnimationFrame(tick);
+  };
   const quotaProfile = quotaSelection?.configDir === configDir
     ? providerRows.find((row) => row.source === "official" && row.id === quotaSelection.id && row.canQueryQuota && (row.email ?? null) === quotaSelection.email)
     : undefined;
@@ -453,15 +524,58 @@ function ListPage({
         </div>
       </header>
 
-      <div className="cx-providers-list" role="list">
+      <p className="cx-providers-sort-hint">{lang === "zh" ? "拖动卡片左侧手柄调整顺序，自动保存。" : "Drag the handle on the left to reorder. Changes save automatically."}</p>
+      <div className="cx-providers-list" role="list" ref={listRef}>
         {providerRows.length === 0 ? (
           <div className="cx-providers-empty" role="status">{copy.noProviders}</div>
         ) : providerRows.map((row) => {
           const testingKey = row.testingKey || `${row.source}-${row.id}`;
           const isTesting = testingId === testingKey;
           const isProtectedOfficial = row.source === "official" && row.isDefaultOfficial === true;
+          const key = providerRowKey(row);
+          const modelName = row.modelDisplayName || row.model || (lang === "zh" ? "跟随 Codex" : "Follow Codex");
           return (
-            <article className={`cx-providers-row${row.isCurrent ? " cx-providers-row--current" : ""}${row.source === "official" ? " cx-providers-row--official" : ""}`} key={`${row.source}-${row.id}-${row.baseUrl}`} role="listitem">
+            <article className={`cx-providers-row${row.isCurrent ? " cx-providers-row--current" : ""}${row.source === "official" ? " cx-providers-row--official" : ""}${draggedKey === key ? " cx-providers-row--dragging" : ""}${dropTarget?.key === key && draggedKey !== key ? ` cx-providers-row--drop-${dropTarget.position}` : ""}`} key={key} role="listitem" data-provider-key={key}>
+              <button type="button" className="cx-providers-drag-handle" disabled={sortingDisabled}
+                aria-label={lang === "zh" ? `排序 ${row.providerName}：拖动或按上下箭头移动` : `Reorder ${row.providerName}: drag or use Up and Down arrows`}
+                title={lang === "zh" ? "拖动排序，也可按上下箭头移动" : "Drag to reorder, or use Up and Down arrows"}
+                onPointerDown={(event) => {
+                  if (sortingDisabled || event.button !== 0) return;
+                  event.preventDefault();
+                  event.currentTarget.focus();
+                  event.currentTarget.setPointerCapture(event.pointerId);
+                  pointerDragRef.current = { key, pointerId: event.pointerId, startY: event.clientY, moved: false };
+                }}
+                onPointerMove={(event) => {
+                  const drag = pointerDragRef.current;
+                  if (!drag || drag.pointerId !== event.pointerId || sortingDisabled) return;
+                  if (!drag.moved && Math.abs(event.clientY - drag.startY) < 5) return;
+                  drag.moved = true;
+                  pointerPositionRef.current = { x: event.clientX, y: event.clientY };
+                  setDraggedKey(drag.key);
+                  updateDropTarget(event.clientX, event.clientY);
+                  startAutoScroll();
+                }}
+                onPointerUp={(event) => {
+                  const drag = pointerDragRef.current;
+                  const target = dropTargetRef.current;
+                  if (!drag || drag.pointerId !== event.pointerId) return;
+                  finishDrag();
+                  if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+                  const bounds = listRef.current?.getBoundingClientRect();
+                  const inside = bounds && event.clientX >= bounds.left && event.clientX <= bounds.right && event.clientY >= bounds.top && event.clientY <= bounds.bottom;
+                  if (drag.moved && target && inside && !sortingDisabled) void reorder(drag.key, target.key, target.position);
+                }}
+                onPointerCancel={finishDrag}
+                onLostPointerCapture={finishDrag}
+                onKeyDown={(event) => {
+                  if (sortingDisabled || !["ArrowUp", "ArrowDown"].includes(event.key)) return;
+                  event.preventDefault();
+                  const index = providerRows.findIndex((entry) => providerRowKey(entry) === key);
+                  const target = providerRows[index + (event.key === "ArrowUp" ? -1 : 1)];
+                  if (target) void reorder(key, providerRowKey(target), event.key === "ArrowUp" ? "before" : "after");
+                }}
+              ><GripVertical size={16} aria-hidden="true" /></button>
               <ProviderAvatar row={row} />
               <div className="cx-providers-row-content">
                 <div className="cx-providers-row-main">
@@ -474,6 +588,7 @@ function ListPage({
                     )}
                   </div>
                   <code title={row.baseUrl || copy.noBaseUrlLabel}>{row.baseUrl || copy.noBaseUrlLabel}</code>
+                  <div className="cx-providers-row-model" title={row.model || modelName}><span>{lang === "zh" ? "模型" : "Model"}</span><b>{modelName}</b>{row.modelDisplayName && row.modelDisplayName !== row.model && <code>{row.model}</code>}</div>
                   {row.source !== "official" && row.meta && <div className="cx-providers-row-meta">{row.meta}</div>}
                 </div>
               </div>

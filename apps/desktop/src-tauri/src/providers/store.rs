@@ -1,7 +1,8 @@
 use super::{clear_provider_selections_on_connection, open_store as open_db};
 use crate::error::{CodexxError, Result};
-use crate::{now_rfc3339, sanitize_id};
-use rusqlite::{params, Connection, TransactionBehavior};
+use crate::paths::normalized_path_scope;
+use crate::{now_rfc3339, resolve_codex_dir, sanitize_id};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use toml_edit::{value, DocumentMut};
@@ -409,6 +410,94 @@ pub(crate) fn list_saved_providers_on_connection(conn: &Connection) -> Result<Ve
 pub(crate) fn list_saved_providers_inner() -> Result<Vec<SavedProvider>> {
     let conn = open_db()?;
     list_saved_providers_on_connection(&conn)
+}
+
+fn validate_provider_card_order(order: &[String]) -> Result<()> {
+    if order.len() > 4096 {
+        return Err(CodexxError::Config("供应商排序项过多".to_string()));
+    }
+    let mut seen = HashSet::with_capacity(order.len());
+    for key in order {
+        let valid_key = key.split_once(':').is_some_and(|(source, id)| {
+            matches!(source, "official" | "local" | "detected")
+                && !id.trim().is_empty()
+                && id.trim() == id
+                && key.len() <= 512
+                && !key.chars().any(char::is_control)
+        });
+        if !valid_key {
+            return Err(CodexxError::Config(
+                "供应商排序包含无效卡片标识".to_string(),
+            ));
+        }
+        if !seen.insert(key) {
+            return Err(CodexxError::Config("供应商排序包含重复卡片".to_string()));
+        }
+    }
+    Ok(())
+}
+
+fn get_provider_order_on_connection(
+    conn: &Connection,
+    codex_dir: &std::path::Path,
+) -> Result<Vec<String>> {
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT order_json FROM provider_card_orders WHERE codex_dir = ?1",
+            [normalized_path_scope(codex_dir)],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| CodexxError::Database(error.to_string()))?;
+    json.map(|json| {
+        serde_json::from_str(&json)
+            .map_err(|error| CodexxError::Database(format!("读取供应商排序失败: {error}")))
+    })
+    .transpose()
+    .map(Option::unwrap_or_default)
+}
+
+pub(crate) fn get_provider_order_inner(config_dir: Option<String>) -> Result<Vec<String>> {
+    let codex_dir = resolve_codex_dir(config_dir)?;
+    get_provider_order_on_connection(&open_db()?, &codex_dir)
+}
+
+fn save_provider_order_on_connection(
+    conn: &mut Connection,
+    codex_dir: &std::path::Path,
+    order: Vec<String>,
+) -> Result<Vec<String>> {
+    validate_provider_card_order(&order)?;
+    let json = serde_json::to_string(&order)
+        .map_err(|error| CodexxError::Config(format!("序列化供应商排序失败: {error}")))?;
+    let transaction = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| CodexxError::Database(error.to_string()))?;
+    // Keep the preference independent of provider records. A refresh, import,
+    // edit, or temporary detected row must not change the user's chosen order;
+    // the UI ignores absent keys and appends newly added cards.
+    transaction
+        .execute(
+            "INSERT INTO provider_card_orders (codex_dir, order_json, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(codex_dir) DO UPDATE SET
+                order_json = excluded.order_json,
+                updated_at = excluded.updated_at",
+            params![normalized_path_scope(codex_dir), json, now_rfc3339()],
+        )
+        .map_err(|error| CodexxError::Database(error.to_string()))?;
+    transaction
+        .commit()
+        .map_err(|error| CodexxError::Database(error.to_string()))?;
+    Ok(order)
+}
+
+pub(crate) fn save_provider_order_inner(
+    config_dir: Option<String>,
+    order: Vec<String>,
+) -> Result<Vec<String>> {
+    let codex_dir = resolve_codex_dir(config_dir)?;
+    save_provider_order_on_connection(&mut open_db()?, &codex_dir, order)
 }
 
 pub(crate) fn provider_by_id_on_connection(
@@ -1233,6 +1322,175 @@ mod tests {
         let conn = test_connection();
         conn.execute_batch("CREATE TABLE active_provider_selections (codex_dir TEXT PRIMARY KEY, provider_id TEXT NOT NULL, updated_at TEXT NOT NULL);").unwrap();
         conn
+    }
+
+    fn provider_order_test_connection() -> Connection {
+        let conn = test_connection();
+        conn.execute_batch(
+            "CREATE TABLE provider_card_orders (
+                codex_dir TEXT PRIMARY KEY, order_json TEXT NOT NULL, updated_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn provider_card_order_persists_across_connections_and_keeps_config_scopes_independent() {
+        let database_file = tempfile::NamedTempFile::new().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let other_directory = tempfile::tempdir().unwrap();
+        let mut conn = Connection::open(database_file.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE provider_card_orders (
+                codex_dir TEXT PRIMARY KEY, order_json TEXT NOT NULL, updated_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        assert!(get_provider_order_on_connection(&conn, directory.path())
+            .unwrap()
+            .is_empty());
+        let chosen = vec![
+            "local:shared-id".to_string(),
+            "official:shared-id".to_string(),
+            "detected:detected-自定义".to_string(),
+            "official:openai-official".to_string(),
+        ];
+        assert_eq!(
+            save_provider_order_on_connection(&mut conn, directory.path(), chosen.clone()).unwrap(),
+            chosen
+        );
+        let second = vec!["official:another-account".to_string()];
+        save_provider_order_on_connection(&mut conn, other_directory.path(), second.clone())
+            .unwrap();
+        drop(conn);
+        let reopened = Connection::open(database_file.path()).unwrap();
+        assert_eq!(
+            get_provider_order_on_connection(&reopened, directory.path()).unwrap(),
+            chosen
+        );
+        assert_eq!(
+            get_provider_order_on_connection(&reopened, other_directory.path()).unwrap(),
+            second
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_card_order_resolves_linked_config_directory_to_the_same_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let alias_root = tempfile::tempdir().unwrap();
+        let alias = alias_root.path().join("linked-config");
+        std::os::unix::fs::symlink(directory.path(), &alias).unwrap();
+        let mut conn = provider_order_test_connection();
+        let order = vec!["local:linked-provider".to_string()];
+        save_provider_order_on_connection(&mut conn, &alias, order.clone()).unwrap();
+        assert_eq!(
+            get_provider_order_on_connection(&conn, directory.path()).unwrap(),
+            order
+        );
+    }
+
+    #[test]
+    fn provider_card_order_survives_provider_refresh_edits_additions_and_deletions() {
+        let mut conn = provider_order_test_connection();
+        let directory = std::path::Path::new("/fixture/provider-order-lifecycle");
+        let original = provider("ordered-provider", "Imported", Some("fixture-key"));
+        upsert_ccswitch_provider_on_connection(&conn, original.clone(), "ordered-source").unwrap();
+        let order = vec![
+            "local:ordered-provider".to_string(),
+            "official:openai-official".to_string(),
+            "detected:detected-temporary".to_string(),
+        ];
+        save_provider_order_on_connection(&mut conn, directory, order.clone()).unwrap();
+        assert_eq!(
+            provider_by_id_on_connection(&conn, &original.id).unwrap(),
+            Some(original)
+        );
+
+        let fresh = provider("external-id", "Refreshed import", Some("fixture-key"));
+        let refreshed = upsert_ccswitch_provider_on_connection(&conn, fresh, "ordered-source")
+            .unwrap()
+            .provider;
+        assert_eq!(refreshed.id, "ordered-provider");
+        let mut edited = refreshed;
+        edited.model = "other-model".to_string();
+        save_manual_provider_on_connection(&conn, edited).unwrap();
+        save_manual_provider_on_connection(
+            &conn,
+            provider("new-provider", "New provider", Some("new-fixture-key")),
+        )
+        .unwrap();
+        conn.execute("DELETE FROM providers WHERE id = 'ordered-provider'", [])
+            .unwrap();
+        assert_eq!(
+            get_provider_order_on_connection(&conn, directory).unwrap(),
+            order
+        );
+        save_provider_order_on_connection(&mut conn, directory, Vec::new()).unwrap();
+        assert!(get_provider_order_on_connection(&conn, directory)
+            .unwrap()
+            .is_empty());
+        assert!(provider_by_id_on_connection(&conn, "new-provider")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn provider_card_order_rejects_invalid_or_duplicate_keys_without_overwriting_saved_order() {
+        let mut conn = provider_order_test_connection();
+        let directory = std::path::Path::new("/fixture/provider-order-validation");
+        let order = vec!["local:kept-provider".to_string()];
+        save_provider_order_on_connection(&mut conn, directory, order.clone()).unwrap();
+        for invalid in [
+            vec![
+                "local:kept-provider".to_string(),
+                "local:kept-provider".to_string(),
+            ],
+            vec!["unknown:provider".to_string()],
+            vec!["local:".to_string()],
+            vec!["official: account".to_string()],
+            vec!["detected:invalid\nprovider".to_string()],
+            vec![format!("local:{}", "x".repeat(512))],
+            (0..4097).map(|id| format!("local:{id}")).collect(),
+        ] {
+            assert!(save_provider_order_on_connection(&mut conn, directory, invalid).is_err());
+            assert_eq!(
+                get_provider_order_on_connection(&conn, directory).unwrap(),
+                order
+            );
+        }
+    }
+
+    #[test]
+    fn provider_card_order_database_failure_rolls_back_the_entire_order() {
+        let mut conn = provider_order_test_connection();
+        let directory = std::path::Path::new("/fixture/provider-order-rollback");
+        let before = vec![
+            "official:openai-official".to_string(),
+            "local:kept".to_string(),
+        ];
+        save_provider_order_on_connection(&mut conn, directory, before.clone()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_provider_card_order BEFORE UPDATE ON provider_card_orders
+             BEGIN SELECT RAISE(ABORT, 'fixture order persistence failure'); END;",
+        )
+        .unwrap();
+        assert!(save_provider_order_on_connection(
+            &mut conn,
+            directory,
+            vec![
+                "local:kept".to_string(),
+                "official:openai-official".to_string()
+            ],
+        )
+        .is_err());
+        assert_eq!(
+            get_provider_order_on_connection(&conn, directory).unwrap(),
+            before
+        );
+        assert!(
+            conn.is_autocommit(),
+            "failed save must release its transaction"
+        );
     }
 
     #[test]

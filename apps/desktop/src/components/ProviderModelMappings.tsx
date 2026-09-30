@@ -11,6 +11,7 @@ function getCopy(lang: Language) {
   return lang === "zh" ? {
     title: "模型映射", optional: "可选", subtitle: "让 Codex 的模型菜单显示这个供应商实际提供的模型。",
     hint: "适用于支持 Responses 接口的模型。保存并启用后，重启 Codex 更新模型菜单。已有会话会保留原来的模型选择。",
+    capabilities: "模型菜单允许文本与图片输入；实际能力由供应商接口决定。Ultra 还需在 Codex 设置中开启「模型选择器滑块中的 Ultra 选项」。",
     displayName: "菜单显示名称", displayPlaceholder: "留空使用模型 ID", model: "实际模型 ID", modelPlaceholder: "填写供应商提供的模型 ID",
     context: "上下文窗口", contextPlaceholder: "可选，如 128000", contextHint: "单位为 Token；留空使用默认值，最大 10,000,000。",
     addCurrent: "添加当前模型", importModels: "导入已获取模型", addRow: "添加空行", remove: "删除映射",
@@ -25,6 +26,7 @@ function getCopy(lang: Language) {
   } : {
     title: "Model mappings", optional: "Optional", subtitle: "Show this provider’s actual models in the Codex model menu.",
     hint: "For models that support the Responses API. Save and enable this provider, then restart Codex to update its model menu. Existing conversations keep their selected model.",
+    capabilities: "The menu allows text and image input; actual support depends on the provider API. To show Ultra, also enable the Ultra option in the model picker slider in Codex settings.",
     displayName: "Menu display name", displayPlaceholder: "Defaults to the model ID", model: "Actual model ID", modelPlaceholder: "Enter the provider’s model ID",
     context: "Context window", contextPlaceholder: "Optional, e.g. 128000", contextHint: "In tokens. Leave blank for the default; maximum 10,000,000.",
     addCurrent: "Add current model", importModels: "Import fetched models", addRow: "Add row", remove: "Remove mapping",
@@ -136,6 +138,7 @@ export function ProviderModelMappings({ lang, rows, currentModel, availableModel
     <summary><ListFilter size={17} aria-hidden="true" /><div><strong>{copy.title}<span>{copy.optional}</span></strong><p>{copy.subtitle}</p></div><span className={`cx-provider-mappings-count${!validation.valid ? " cx-provider-mappings-count--invalid" : ""}`} title={copy.limit}>{validation.size} / {MAX_MAPPINGS}</span><ChevronDown size={16} className="cx-provider-mappings-chevron" aria-hidden="true" /></summary>
     <div className="cx-provider-mappings-body">
       <p className="cx-provider-mappings-hint">{copy.hint}</p>
+      <p className="cx-provider-mappings-hint">{copy.capabilities}</p>
       <div className="cx-provider-mappings-toolbar">
         <button type="button" className="cx-providers-button cx-providers-button--secondary cx-providers-button--small" onClick={() => add(current)} disabled={disabled || !canAddCurrent} title={currentIncluded ? copy.currentExists : !current ? copy.noCurrent : hasInvalidModelId(current) ? copy.invalidDefault : !canAddCurrent ? copy.limit : undefined}><Plus size={14} aria-hidden="true" />{copy.addCurrent}</button>
         <button type="button" className="cx-providers-button cx-providers-button--secondary cx-providers-button--small" onClick={importModels} disabled={disabled || !canImport} title={!availableModels.length ? copy.fetchFirst : !candidates.length ? copy.allImported : !canImport ? copy.limit : undefined}><Download size={14} aria-hidden="true" />{copy.importModels}</button>

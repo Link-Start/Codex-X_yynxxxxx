@@ -9,7 +9,8 @@
   const counts = {};
   const switches = [];
   const commands = [];
-  const pending = { sync: [], detail: [], quota: [], resetCredits: [], usage: [] };
+  const pending = { sync: [], detail: [], quota: [], resetCredits: [], usage: [], providerOrder: [] };
+  const providerOrders = new Map();
   const callbacks = new Map();
   const eventListeners = new Map();
   let nextCallback = 1;
@@ -35,6 +36,7 @@
   const resetRoutingHealth = new Set();
   let failoverMode = "normal";
   let providerBaseReadFailure = false;
+  let providerOrderMode = "normal";
   const updaterEnabled = new URLSearchParams(location.search).has("updater");
   let updateRequest = null;
   function updateStage(event) { updateRequest?.onEvent.onmessage(event); }
@@ -232,6 +234,11 @@
       state = saved.state;
       if (saved.failoverSettings?.version === 2) failoverSettings = { ...defaultRoutingSettings(), ...saved.failoverSettings };
       savedProviders = saved.savedProviders;
+      for (const [scope, order] of Object.entries(saved.providerOrders || {})) {
+        if (Array.isArray(order) && order.every((key) => typeof key === "string")) {
+          providerOrders.set(scope, clone(order));
+        }
+      }
       savedPrompts = saved.savedPrompts;
       nextOfficialId = saved.nextOfficialId;
       officialProfiles.clear();
@@ -247,6 +254,7 @@
         version: 2,
         state,
         savedProviders,
+        providerOrders: Object.fromEntries(providerOrders),
         savedPrompts,
         nextOfficialId,
         failoverSettings,
@@ -290,6 +298,9 @@
       usageMode,
       pendingUsage: pending.usage.length,
       savedProviderIds: savedProviders.map((provider) => provider.id),
+      providerOrders: Object.fromEntries(providerOrders),
+      providerOrderMode,
+      pendingProviderOrder: pending.providerOrder.length,
       commands: clone(commands),
     };
   }
@@ -373,6 +384,52 @@
     if (existingIndex >= 0) savedProviders[existingIndex] = next;
     else savedProviders.push(next);
     return next;
+  }
+
+  function providerOrderScope(configDir) {
+    // Virtual fixture paths have no filesystem or symlinks. Normalize simple
+    // absolute paths only; Rust tests cover real canonical paths and aliases.
+    const raw = typeof configDir === "string" && configDir.trim() ? configDir.trim() : codexDir;
+    const parts = [];
+    for (const part of raw.replaceAll("\\", "/").split("/")) {
+      if (!part || part === ".") continue;
+      if (part === "..") parts.pop();
+      else parts.push(part);
+    }
+    return `/${parts.join("/")}`;
+  }
+
+  function getProviderOrder(configDir) {
+    return clone(providerOrders.get(providerOrderScope(configDir)) || []);
+  }
+
+  function setProviderOrderMode(mode) {
+    if (!["normal", "error", "pending", "pending-error"].includes(mode)) throw new Error("Unknown fixture provider-order mode");
+    providerOrderMode = mode;
+    render();
+  }
+
+  function saveProviderOrder({ configDir, order }) {
+    if (!Array.isArray(order) || order.some((key) => {
+      if (typeof key !== "string" || /[\u0000-\u001f\u007f-\u009f]/.test(key)) return true;
+      const separator = key.indexOf(":");
+      const source = key.slice(0, separator);
+      const id = key.slice(separator + 1);
+      return !["official", "local", "detected"].includes(source) || !id || id !== id.trim();
+    }) || new Set(order).size !== order.length) throw new Error("Fixture：排序包含无效或重复供应商");
+    const scope = providerOrderScope(configDir);
+    const next = clone(order);
+    const mode = providerOrderMode;
+    const failure = "Fixture：供应商排序保存失败，原顺序未改变";
+    if (mode === "error") throw new Error(failure);
+    const save = () => {
+      providerOrders.set(scope, next);
+      return next;
+    };
+    if (mode === "pending" || mode === "pending-error") {
+      return defer("providerOrder", save, mode === "pending-error" ? failure : null);
+    }
+    return clone(save());
   }
 
   function uniqueCopyName(requested, names) {
@@ -843,6 +900,9 @@
         if (configStateError) throw new Error("Fixture：Codex 无法加载配置，Model provider my_codex not found。");
         return clone(state);
       case "list_saved_providers": return clone(savedProviders);
+      case "get_provider_order": return getProviderOrder(args.configDir);
+      case "save_provider_order": return saveProviderOrder(args);
+      case "repair_provider_model_catalog": return { changed: false };
       case "list_saved_prompts": return clone(savedPrompts);
       case "get_builtin_prompt_status": return clone(statuses);
       case "list_official_profiles":
@@ -1030,6 +1090,10 @@
     loginSecondOfficialAccount,
     setUsageMode,
     setQuotaMode,
+    setProviderOrderMode,
+    getProviderOrder,
+    completeProviderOrder: () => settle("providerOrder", false),
+    failProviderOrder: () => settle("providerOrder", true),
     completeQuota: () => settle("quota", false),
     failQuota: () => settle("quota", true),
     completeSync: () => settle("sync", false),
@@ -1136,6 +1200,22 @@
     resetCompleteButton.style.cssText = loginButton.style.cssText;
     resetCompleteButton.addEventListener("click", () => settle("resetCredits", false));
     controls.append(resetCompleteButton);
+    const orderModeLabel = document.createElement("label");
+    orderModeLabel.textContent = "Fixture：排序保存 ";
+    const orderModeSelect = document.createElement("select");
+    orderModeSelect.setAttribute("aria-label", "Fixture：排序保存");
+    orderModeSelect.style.cssText = quotaModeSelect.style.cssText;
+    for (const [value, text] of [["normal", "正常"], ["error", "保存失败"], ["pending", "延迟成功"], ["pending-error", "延迟失败"]]) {
+      const option = document.createElement("option");
+      option.value = value; option.textContent = text; orderModeSelect.append(option);
+    }
+    orderModeSelect.addEventListener("change", () => setProviderOrderMode(orderModeSelect.value));
+    orderModeLabel.append(orderModeSelect); controls.append(orderModeLabel);
+    for (const [text, failure] of [["Fixture：完成排序保存", false], ["Fixture：使排序保存失败", true]]) {
+      const button = document.createElement("button");
+      button.type = "button"; button.textContent = text; button.style.cssText = loginButton.style.cssText;
+      button.addEventListener("click", () => settle("providerOrder", failure)); controls.append(button);
+    }
     const pauseUsageLabel = document.createElement("label");
     const pauseUsageInput = document.createElement("input");
     pauseUsageInput.type = "checkbox";

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-const APP_DB_SCHEMA_VERSION: i64 = 7;
+const APP_DB_SCHEMA_VERSION: i64 = 8;
 
 struct DatabaseInitializer {
     migration_lock: Mutex<()>,
@@ -228,6 +228,11 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
             codex_dir TEXT PRIMARY KEY,
             profile_id TEXT NOT NULL,
             updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS provider_card_orders (
+            codex_dir TEXT PRIMARY KEY,
+            order_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         );",
     )
     .map_err(|e| CodexxError::Database(e.to_string()))?;
@@ -429,6 +434,66 @@ mod tests {
                 "original-updated".into(),
                 "[]".into()
             )
+        );
+        drop(migrated);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn version_seven_database_adds_card_order_preferences_without_changing_provider_data() {
+        let path = test_db_path("provider-card-order-v8");
+        let initializer = DatabaseInitializer::new();
+        let legacy = initializer.open_at(&path).unwrap();
+        legacy.execute_batch(
+            "INSERT INTO providers
+               (id, provider_name, base_url, model, api_key, created_at, updated_at)
+             VALUES ('existing', 'Existing provider', 'https://fixture.test/v1', 'fixture-model',
+               'fixture-key', 'original-created', 'original-updated');
+             INSERT INTO official_profiles
+               (codex_dir, id, provider_name, created_at, updated_at)
+             VALUES ('/fixture/config', 'existing-account', 'Existing account', 'created', 'updated');
+             DROP TABLE provider_card_orders;
+             PRAGMA user_version = 7;",
+        )
+        .unwrap();
+        let before = crate::providers::list_saved_providers_on_connection(&legacy).unwrap();
+        drop(legacy);
+
+        let migrated = initializer.open_at(&path).unwrap();
+        assert_eq!(schema_version(&migrated).unwrap(), APP_DB_SCHEMA_VERSION);
+        assert_eq!(
+            crate::providers::list_saved_providers_on_connection(&migrated).unwrap(),
+            before
+        );
+        let timestamps: (String, String) = migrated
+            .query_row(
+                "SELECT created_at, updated_at FROM providers WHERE id = 'existing'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            timestamps,
+            ("original-created".into(), "original-updated".into())
+        );
+        assert_eq!(
+            migrated
+                .query_row(
+                    "SELECT provider_name FROM official_profiles WHERE id = 'existing-account'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "Existing account"
+        );
+        assert_eq!(
+            migrated
+                .query_row("SELECT COUNT(*) FROM provider_card_orders", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0
         );
         drop(migrated);
         remove_test_db(&path);

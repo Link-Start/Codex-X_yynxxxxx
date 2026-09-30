@@ -24,7 +24,7 @@ import { PageTransition } from "./components/PageTransition";
 import { cx } from "./components/ui";
 import { appUpdater, isAppUpdateBusy, useAppUpdater } from "./appUpdater";
 import { providerProfilesMatch, type ProviderProfile } from "./providerProfiles";
-import { orderProviderRows } from "./providerRowOrder";
+import { applyProviderRowOrder, orderProviderRows } from "./providerRowOrder";
 import { createPresetProvider, getProviderPreset, getProviderPresetVariant } from "./providerPresets";
 import { validateProviderModelMappings } from "./components/ProviderModelMappings";
 import { createOfficialProfileMonitor } from "./officialProfileMonitor";
@@ -755,6 +755,7 @@ function App() {
   const [editingPromptId, setEditingPromptId] = React.useState<string | null>(null);
   const [editingBuiltinPrompt, setEditingBuiltinPrompt] = React.useState<BuiltinPromptDetail | null>(null);
   const [savedProviders, setSavedProviders] = React.useState<SavedProvider[]>([]);
+  const [providerOrder, setProviderOrder] = React.useState<{ directory: string; order: string[] }>({ directory: "", order: [] });
   const [officialProfiles, setOfficialProfiles] = React.useState<OfficialProfileSummary[]>([]);
   const [editingOfficialProfileId, setEditingOfficialProfileId] = React.useState<string | null>(DEFAULT_OFFICIAL_PROFILE_ID);
   const [creatingProvider, setCreatingProvider] = React.useState(false);
@@ -836,6 +837,7 @@ function App() {
   const officialMonitorReadyRef = React.useRef(false);
   officialMonitorReadyRef.current = Boolean(state) && !refreshing;
   const savedProvidersRequestRef = React.useRef(0);
+  const providerOrderRequestRef = React.useRef(0);
   const loadingGenerationRef = React.useRef(0);
   const loadingTokensRef = React.useRef(new Set<number>());
   const actionBusyGenerationRef = React.useRef(0);
@@ -933,6 +935,18 @@ function App() {
     savedProvidersRequestRef.current += 1;
     setSavedProviders(providers);
   }, []);
+  React.useEffect(() => {
+    const directory = state?.codexDir || "";
+    const request = ++providerOrderRequestRef.current;
+    if (!directory) { setProviderOrder({ directory: "", order: [] }); return; }
+    void invoke<string[]>("get_provider_order", { configDir: directory }).then((order) => {
+      if (request === providerOrderRequestRef.current) setProviderOrder({ directory, order });
+    }).catch((nextError) => {
+      if (request !== providerOrderRequestRef.current) return;
+      setProviderOrder({ directory, order: [] });
+      setError(String(nextError));
+    });
+  }, [state?.codexDir]);
   const currentInstructionId = instructionIdFromPath(state?.instructionFile, instructionTemplates);
   const releaseStatusLabel = React.useMemo(() => {
     if (updater.state.phase === "downloading") return lang === "zh" ? "下载中" : "Downloading";
@@ -1175,10 +1189,11 @@ function App() {
   const localRows = React.useMemo(() => {
     return savedProviders.map((p) => ({
       ...p,
+      model: effectiveActiveProviderId === p.id ? state?.model || p.model : p.model,
       source: "local" as const,
       isCurrent: effectiveActiveProviderId === p.id,
     }));
-  }, [effectiveActiveProviderId, savedProviders]);
+  }, [effectiveActiveProviderId, savedProviders, state?.model]);
 
   const currentOfficialProfileId = state?.isOfficialProvider
     ? state.activeOfficialProfileId || DEFAULT_OFFICIAL_PROFILE_ID
@@ -1201,7 +1216,7 @@ function App() {
       source: "official",
       providerName: profile.providerName,
       baseUrl: "https://chatgpt.com/codex",
-      model: profile.model || "official",
+      model: profile.id === currentOfficialProfileId ? profile.model || state?.model || "" : profile.model || "",
       apiKey: "",
       wireApi: "official",
       requiresOpenaiAuth: true,
@@ -1214,7 +1229,7 @@ function App() {
     });
     const rows = orderProviderRows(officialRow(defaultProfile), detectedRows, localRows);
     return [rows[0], ...officialProfiles.filter((profile) => !profile.isDefault).map(officialRow), ...rows.slice(1)];
-  }, [currentOfficialProfileId, detectedRows, lang, localRows, officialProfiles, state?.officialAuthAvailable]);
+  }, [currentOfficialProfileId, detectedRows, lang, localRows, officialProfiles, state?.officialAuthAvailable, state?.model]);
 
   const findLocalProviderForRow = React.useCallback((row: ProviderRow) => {
     if (row.source === "official") return undefined;
@@ -1241,7 +1256,8 @@ function App() {
     };
   }, [findLocalProviderForRow, state?.configText]);
 
-  const providerPageRows = React.useMemo<ProviderRow[]>(() => providerRows.map((row) => {
+  const providerPageRows = React.useMemo<ProviderRow[]>(() => applyProviderRowOrder(providerRows,
+    providerOrder.directory === state?.codexDir ? providerOrder.order : []).map((row) => {
     const local = findLocalProviderForRow(row);
     return {
       id: row.id,
@@ -1249,6 +1265,7 @@ function App() {
       providerName: row.providerName,
       baseUrl: row.baseUrl,
       model: row.model,
+      modelDisplayName: local?.modelMappings?.find((mapping) => mapping.model === row.model)?.displayName,
       apiKey: row.apiKey,
       wireApi: row.wireApi,
       requiresOpenaiAuth: row.requiresOpenaiAuth,
@@ -1266,7 +1283,32 @@ function App() {
       testable: row.source !== "official",
       testingKey: `${row.source}-${row.id}`,
     };
-  }), [findLocalProviderForRow, lang, providerCopySourceForRow, providerRows]);
+  }), [findLocalProviderForRow, lang, providerCopySourceForRow, providerRows, providerOrder, state?.codexDir]);
+
+  const saveProviderOrder = async (order: string[]): Promise<boolean> => {
+    const directory = state?.codexDir;
+    if (!directory || providerOrder.directory !== directory || loadingTokensRef.current.size || actionBusyTokensRef.current.size) return false;
+    const previous = providerOrder;
+    const request = ++providerOrderRequestRef.current;
+    const actionToken = beginActionBusy("reorderProviders");
+    setProviderOrder({ directory, order });
+    try {
+      const saved = await invoke<string[]>("save_provider_order", { configDir: directory, order });
+      if (request === providerOrderRequestRef.current && normalizedConfigDirForComparison(directory) === activeConfigDirKeyRef.current) {
+        setProviderOrder({ directory, order: saved });
+        setToast(lang === "zh" ? "供应商顺序已保存" : "Provider order saved");
+      }
+      return true;
+    } catch (nextError) {
+      if (request === providerOrderRequestRef.current && normalizedConfigDirForComparison(directory) === activeConfigDirKeyRef.current) {
+        setProviderOrder(previous);
+        setError(String(nextError));
+      }
+      return false;
+    } finally {
+      endActionBusy(actionToken);
+    }
+  };
 
   const visibleSessions = React.useMemo(
     () => (sessionStatus?.sessions || []).filter((item) => showInternalSessions || !item.isSubagent),
@@ -1342,6 +1384,7 @@ function App() {
   }, [beginLoading, endLoading]);
 
   const refresh = React.useCallback((includeDiagnostics: boolean) => {
+    if (Array.from(actionBusyTokensRef.current.values()).includes("reorderProviders")) return;
     invalidatePromptDetail();
     const requestId = ++refreshRequestRef.current;
     const profilesRequestId = ++officialProfilesRequestRef.current;
@@ -1389,7 +1432,16 @@ function App() {
       setStartupDiagnosticsLoading(false);
     }
 
-    void invoke<CodexState>("get_codex_state", { configDir: resolvedConfigDir })
+    void invoke<{ changed: boolean }>("repair_provider_model_catalog", { configDir: resolvedConfigDir })
+      .then((repair) => {
+        if (repair.changed && requestId === refreshRequestRef.current) {
+          setToast(lang === "zh" ? "已修复第三方模型的图片输入能力，请重启 Codex 加载新菜单" : "Third-party model image input repaired. Restart Codex to reload the model menu.");
+        }
+      })
+      .catch((repairError) => {
+        if (requestId === refreshRequestRef.current) setError(String(repairError));
+      })
+      .then(() => invoke<CodexState>("get_codex_state", { configDir: resolvedConfigDir }))
       .then((next) => {
         if (requestId !== refreshRequestRef.current) return;
         if (normalizedConfigDirForComparison(next.codexDir)
@@ -1437,7 +1489,7 @@ function App() {
         setRefreshing(false);
         setError(String(nextError));
       });
-  }, [clearActionBusy, configDir, configDirDraft, invalidatePromptDetail, state?.codexDir]);
+  }, [clearActionBusy, configDir, configDirDraft, invalidatePromptDetail, lang, state?.codexDir]);
 
   // Independent of get_codex_state: this must still work when a broken TOML
   // prevents the normal app state from loading. No shared loading flags change.
@@ -3043,7 +3095,7 @@ function App() {
                     ? `${state.agentsPath} (${lang === "zh" ? "追加模式" : "append"})`
                     : state.instructionFile)
                   : null}
-                loading={loading || refreshing}
+                loading={loading || refreshing || actionBusy === "reorderProviders"}
                 hasUpdate={Boolean(releaseInfo.status === "ok" && releaseInfo.hasUpdate)}
                 latestVersion={releaseInfo.latestVersion}
                 onConfigDirChange={setConfigDirDraft}
@@ -3069,6 +3121,8 @@ function App() {
                 loading={loading}
                 testingId={providerTestingId}
                 actionBusy={actionBusy}
+                orderBusy={providerOrder.directory !== state.codexDir}
+                onReorderProviders={saveProviderOrder}
                 editingProviderId={editingProviderId || (editingDetectedProvider ? providerForm.id : null)}
                 providerForm={{
                   apiKey: providerForm.apiKey || "",

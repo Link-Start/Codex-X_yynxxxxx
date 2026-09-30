@@ -2907,6 +2907,20 @@ env_http_headers = { aUtHoRiZaTiOn = "STALE_AUTH", "X-Project" = "PROJECT_ENV" }
         assert_eq!(models[0]["display_name"], "DeepSeek V3");
         assert_eq!(models[1]["slug"], "deepseek-reasoner");
         assert_eq!(models[1]["context_window"], 256000);
+        for model in models {
+            assert_eq!(
+                model["input_modalities"],
+                serde_json::json!(["text", "image"])
+            );
+            assert_eq!(
+                model["supported_reasoning_levels"]
+                    .as_array()
+                    .unwrap()
+                    .last()
+                    .unwrap()["effort"],
+                "ultra"
+            );
+        }
         assert!(!fs::read_to_string(&pointer)
             .unwrap()
             .contains("fixture-current-key"));

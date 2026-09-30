@@ -199,6 +199,49 @@ invalid context sizes disable Save. Reopening a saved item retains its mappings;
 enabling it shows the restart notice. Actual catalog files, outbound model IDs,
 authentication and rollback are covered by the Rust and native Codex checks.
 
+## Provider card model names and drag ordering (#61 / #62)
+
+1. Reset the fixture. The initial **Fixture CC Switch** model is
+   `fixture-model-a`, **Fixture Saved Provider** uses `fixture-model-b`, and the
+   default official profile uses `fixture-official-model`. The provider cards
+   should show these model names, including the current detected provider.
+2. Copy a saved provider twice and copy an official profile once to create
+   several reorderable rows. Copies keep their selected model; editing a copy's
+   selected model must update its own card when returning to the list.
+3. Drag the card handles up and down, including moving the default official
+   profile. Check the new visual order, leave the provider page, return, and
+   reload. The order must survive. Enabling another row must keep the order and
+   move only the current-provider indicator. Copying or deleting a row must keep
+   the relative order of the remaining rows.
+4. Set **Fixture：排序保存** to **保存失败** and drag a card. The list should
+   return to its previous saved order and show an error. Diagnostics must keep
+   the original `providerOrders` value and no provider switch may occur.
+5. Select **延迟成功**, drag a card, and inspect `pendingProviderOrder: 1`.
+   Use **Fixture：完成排序保存** to settle it. Select **延迟失败** and repeat:
+   settling must reject the request and preserve the original saved order.
+   **Fixture：使排序保存失败** rejects any pending order save explicitly.
+   Changing the selector while a request is pending does not change its outcome.
+6. Check the handles and model labels in both themes, with long provider/model
+   names and keyboard focus. When drag ordering is unavailable during another
+   provider action, the controls should communicate that state.
+
+The fixture implements `get_provider_order({ configDir }) -> string[]` and
+`save_provider_order({ configDir, order }) -> string[]`. Keys use
+`official:<id>`, `local:<id>`, and `detected:<id>`. Duplicate or malformed keys
+reject without mutation; valid stale keys are kept for the renderer to ignore.
+Ordering is stored by the normalized virtual config directory and persisted in
+`codexx.fixture.backend.v2` alongside providers. It does not reorder the backing
+provider arrays or affect failover priority. The virtual scope normalizer handles
+simple slash paths, `.` and `..`; filesystem aliases, migration, and atomic SQL
+writes are covered by the Rust tests. Other fixture data still models one shared
+configuration directory.
+
+Browser assertions may use `window.__CODEX_X_FIXTURE__.setProviderOrderMode(mode)`,
+`.completeProviderOrder()`, `.failProviderOrder()`, and
+`.getProviderOrder(configDir)`. Diagnostics expose `providerOrders`,
+`providerOrderMode`, and `pendingProviderOrder`. Modes reset to `normal` on reload;
+saved order persists. Restart the fixture server after changing `ui-runtime.js`.
+
 ## Provider presets and retained usage results
 
 The add-provider form exposes eight preset cards. Cards show only brand marks and names; switching among all presets, including official sign-in, keeps the same add-page transition key. The initial custom TOML includes a reasoning setting, a fixture MCP server and a project entry for inheritance checks. Selecting a vendor fills its
