@@ -730,7 +730,7 @@ fn preflight_session_jsonl_cleanup(codex_dir: &Path) -> Result<()> {
 
 fn commit_index_cleanup(
     path: &Path,
-    source: &fs::File,
+    source: fs::File,
     prepared: PreparedJsonlCleanup,
 ) -> Result<usize> {
     if prepared.removed == 0 {
@@ -738,7 +738,7 @@ fn commit_index_cleanup(
     }
     ensure_cleanup_source_unchanged(
         path,
-        source,
+        &source,
         &prepared.original_stamp,
         &prepared.original_hash,
     )?;
@@ -750,11 +750,40 @@ fn commit_index_cleanup(
         .output
         .as_file()
         .set_permissions(permissions)
-        .map_err(|error| io_err(path, error))?;
-    prepared
-        .output
-        .persist(path)
-        .map_err(|error| io_err(path, error.error))?;
+        .map_err(|error| {
+            io_err(
+                path,
+                std::io::Error::new(error.kind(), format!("设置临时会话索引权限失败: {error}")),
+            )
+        })?;
+    // tempfile's Windows persist uses SetFileAttributesW followed by MoveFileExW.
+    // Close both our destination and staging handles before that replacement;
+    // the index has no history-style inode/append-lock requirement.
+    drop(source);
+    let output = prepared.output.into_temp_path();
+    let verifier = fs::File::open(path).map_err(|error| {
+        io_err(
+            path,
+            std::io::Error::new(error.kind(), format!("最终复核会话索引失败: {error}")),
+        )
+    })?;
+    let unchanged = ensure_cleanup_source_unchanged(
+        path,
+        &verifier,
+        &prepared.original_stamp,
+        &prepared.original_hash,
+    );
+    drop(verifier);
+    unchanged?;
+    output.persist(path).map_err(|error| {
+        io_err(
+            path,
+            std::io::Error::new(
+                error.error.kind(),
+                format!("原子替换会话索引失败: {}", error.error),
+            ),
+        )
+    })?;
     Ok(prepared.removed)
 }
 
@@ -769,7 +798,7 @@ fn remove_jsonl_session_entries(
         Err(error) => return Err(io_err(path, error)),
     };
     let prepared = prepare_jsonl_cleanup(path, &mut source, id_keys, session_ids, false)?;
-    commit_index_cleanup(path, &source, prepared)
+    commit_index_cleanup(path, source, prepared)
 }
 
 fn remove_session_index_entries(codex_dir: &Path, session_ids: &HashSet<String>) -> Result<usize> {
@@ -1777,20 +1806,98 @@ mod tests {
             drop(external);
             let grown = fs::read(&path).unwrap();
             let result = if history {
-                commit_history_cleanup_with_writer(&path, &mut source, prepared, |_, _, _, _| {
-                    panic!("growth must be rejected before writing history")
-                })
+                let result = commit_history_cleanup_with_writer(
+                    &path,
+                    &mut source,
+                    prepared,
+                    |_, _, _, _| panic!("growth must be rejected before writing history"),
+                );
+                drop(source);
+                result
             } else {
-                commit_index_cleanup(&path, &source, prepared)
+                commit_index_cleanup(&path, source, prepared)
             };
             assert!(result
                 .expect_err("a stale staged result must not replace appended data")
                 .to_string()
                 .contains("发生变化"));
             assert_eq!(fs::read(&path).unwrap(), grown);
-            drop(source);
             fs::remove_dir_all(codex_dir).unwrap();
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn index_replacement_closes_a_delete_denying_source_handle_and_preserves_all_kept_bytes() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let codex_dir = temp_codex_dir();
+        let path = codex_dir.join("session_index.jsonl");
+        fs::write(
+            &path,
+            b"{\"id\":\"selected\"}\r\nnot-json\r\n{\"id\":\"kept\"}",
+        )
+        .unwrap();
+        let mut initial = fs::File::open(&path).unwrap();
+        let prepared = prepare_jsonl_cleanup(
+            &path,
+            &mut initial,
+            &["id"],
+            &HashSet::from(["selected".to_string()]),
+            false,
+        )
+        .unwrap();
+        drop(initial);
+        // Allow all verification reads while denying DELETE sharing, which is
+        // specifically required for Windows rename/replacement operations.
+        let source = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .unwrap();
+        assert_eq!(commit_index_cleanup(&path, source, prepared).unwrap(), 1);
+        assert_eq!(fs::read(&path).unwrap(), b"not-json\r\n{\"id\":\"kept\"}");
+        fs::remove_dir_all(codex_dir).unwrap();
+    }
+
+    #[test]
+    fn index_replacement_rejects_same_length_modified_bytes_even_with_restored_mtime() {
+        let codex_dir = temp_codex_dir();
+        let path = codex_dir.join("session_index.jsonl");
+        let original = b"{\"id\":\"selected\"}\n{\"id\":\"kept\"}\n";
+        fs::write(&path, original).unwrap();
+        let mut source = fs::File::open(&path).unwrap();
+        let prepared = prepare_jsonl_cleanup(
+            &path,
+            &mut source,
+            &["id"],
+            &HashSet::from(["selected".to_string()]),
+            false,
+        )
+        .unwrap();
+        let mtime = prepared.original_stamp.modified.unwrap();
+        let mut changed = original.to_vec();
+        let last = changed.iter().rposition(|byte| *byte == b't').unwrap();
+        changed[last] = b'x';
+        let mut external = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        external.write_all(&changed).unwrap();
+        external.sync_all().unwrap();
+        drop(external);
+        // Set the timestamp through a fresh handle after closing the data writer;
+        // Windows may otherwise finalize a pending write time when it closes.
+        let timestamp = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        timestamp
+            .set_times(fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        drop(timestamp);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+        assert_eq!(fs::metadata(&path).unwrap().len(), original.len() as u64);
+        let error = commit_index_cleanup(&path, source, prepared)
+            .expect_err("a matching length and timestamp must not bypass the source digest");
+        assert!(error.to_string().contains("发生变化"));
+        assert_eq!(fs::read(&path).unwrap(), changed);
+        fs::remove_dir_all(codex_dir).unwrap();
     }
 
     #[test]

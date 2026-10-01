@@ -366,7 +366,9 @@ mod tests {
     #[test]
     fn creation_generation_includes_epoch_sign_full_seconds_and_nanoseconds() {
         use std::time::Duration;
-        let created = UNIX_EPOCH + Duration::new(1234, 17);
+        // Windows SystemTime uses 100 ns intervals; use exactly representable
+        // fractions while still testing that subsecond birth precision matters.
+        let created = UNIX_EPOCH + Duration::new(1234, 100);
         let original = unix_directory_identity(1, 9, Some(created)).unwrap();
         assert!(original.birth_verified);
         assert_eq!(
@@ -374,9 +376,9 @@ mod tests {
             unix_directory_identity(1, 9, Some(created)).unwrap()
         );
         for new_generation in [
-            UNIX_EPOCH + Duration::new(1234, 18),
-            UNIX_EPOCH + Duration::new(1234 + (1u64 << 32), 17),
-            UNIX_EPOCH - Duration::new(1234, 17),
+            UNIX_EPOCH + Duration::new(1234, 200),
+            UNIX_EPOCH + Duration::new(1234 + (1u64 << 32), 100),
+            UNIX_EPOCH - Duration::new(1234, 100),
         ] {
             assert_ne!(
                 original,
@@ -387,7 +389,7 @@ mod tests {
         let file_id = [7; 16];
         assert_ne!(
             windows_directory_identity(1, &file_id, Some(created)),
-            windows_directory_identity(1, &file_id, Some(created + Duration::from_nanos(1)))
+            windows_directory_identity(1, &file_id, Some(created + Duration::from_nanos(100)))
         );
     }
 
