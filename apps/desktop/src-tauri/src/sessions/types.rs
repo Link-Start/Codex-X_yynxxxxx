@@ -25,6 +25,10 @@ pub(crate) struct SessionPreview {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionSyncStatus {
     pub(crate) codex_dir: String,
+    #[serde(default)]
+    pub(crate) directory_identities: HashMap<String, String>,
+    #[serde(default)]
+    pub(crate) pin_scope_key: Option<String>,
     pub(crate) target_provider: String,
     pub(crate) rollout_files: usize,
     pub(crate) session_meta_count: usize,

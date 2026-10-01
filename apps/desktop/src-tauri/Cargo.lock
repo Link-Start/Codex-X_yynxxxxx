@@ -519,6 +519,7 @@ dependencies = [
  "tokio",
  "toml_edit 0.22.27",
  "ureq",
+ "windows-sys 0.61.2",
  "zip 2.4.2",
  "zstd",
 ]

@@ -16,45 +16,29 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button, Checkbox, ModalShell, cx } from "../components/ui";
+import {
+  mergeSessionDirectoryGroups,
+  pinnedSessionDirectoryKeys,
+  readSessionPinPreferences,
+  sessionPinStorageKey,
+  sessionsForDirectoryGroup,
+  toggleFolderPins,
+  type SessionDirectoryIdentities,
+  type SessionPinPreferences,
+} from "../sessionDirectoryIdentity";
 import "../styles/session-management.css";
 
 const SESSION_ROW_HEIGHT = 58;
 const SESSION_COLUMN_HEADER_HEIGHT = 34;
 const SESSION_VIRTUAL_OVERSCAN_ROWS = 8;
 const DEFAULT_SESSION_VIEWPORT_HEIGHT = 640;
-const SESSION_PINS_STORAGE_PREFIX = "codexx.sessionPins.v1";
-const SESSION_FOLDER_UNKNOWN_KEY = "__codexx_no_workspace__";
 const SESSION_ALL_FOLDERS_KEY = "__codexx_all_folders__";
-
-type SessionPinPreferences = {
-  folders: string[];
-  sessions: string[];
-};
+// Defer the browser storage getter so unavailable storage is caught by the reader.
+const sessionPinStorage = { getItem: (key: string) => localStorage.getItem(key) };
 
 type ScopedSessionPinPreferences = SessionPinPreferences & {
   storageKey: string;
 };
-
-function normalizeFolderPinKey(value?: string | null) {
-  const normalized = (value || "").trim().replace(/\\/g, "/").replace(/\/+$/, "");
-  return normalized ? normalized.toLocaleLowerCase() : SESSION_FOLDER_UNKNOWN_KEY;
-}
-
-function sessionPinStorageKey(codexDir: string) {
-  return `${SESSION_PINS_STORAGE_PREFIX}:${encodeURIComponent(normalizeFolderPinKey(codexDir))}`;
-}
-
-function readSessionPinPreferences(storageKey: string): SessionPinPreferences {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(storageKey) || "{}") as Partial<SessionPinPreferences>;
-    return {
-      folders: Array.isArray(parsed.folders) ? parsed.folders.filter((value): value is string => typeof value === "string") : [],
-      sessions: Array.isArray(parsed.sessions) ? parsed.sessions.filter((value): value is string => typeof value === "string") : [],
-    };
-  } catch {
-    return { folders: [], sessions: [] };
-  }
-}
 
 function folderDisplayName(value: string, missing: string) {
   if (!value) return missing;
@@ -99,6 +83,8 @@ export type SessionPreview = {
 
 export type SessionSyncStatus = {
   codexDir: string;
+  directoryIdentities?: SessionDirectoryIdentities;
+  pinScopeKey?: string | null;
   targetProvider: string;
   rolloutFiles: number;
   sessionMetaCount: number;
@@ -356,7 +342,9 @@ export function SessionManagementPage({
   ];
   const dialogOpen = sessionDeleteConfirmOpen && selectedSessions.length > 0;
   const sessionScrollRef = useRef<HTMLDivElement | null>(null);
-  const pinStorageKey = useMemo(() => sessionPinStorageKey(codexDir), [codexDir]);
+  const directoryIdentities = sessionStatus?.directoryIdentities;
+  const pinScopeKey = sessionStatus?.pinScopeKey;
+  const pinStorageKey = useMemo(() => sessionPinStorageKey(codexDir, pinScopeKey), [codexDir, pinScopeKey]);
   const [pinPreferences, setPinPreferences] = useState<ScopedSessionPinPreferences>({
     storageKey: "",
     folders: [],
@@ -369,25 +357,29 @@ export function SessionManagementPage({
   });
 
   useEffect(() => {
-    setPinPreferences({ storageKey: pinStorageKey, ...readSessionPinPreferences(pinStorageKey) });
+    setPinPreferences({ storageKey: pinStorageKey, ...readSessionPinPreferences(pinStorageKey, sessionPinStorage) });
     setSelectedFolderKey(SESSION_ALL_FOLDERS_KEY);
   }, [pinStorageKey]);
 
   const activePinPreferences = pinPreferences.storageKey === pinStorageKey
     ? pinPreferences
     : { storageKey: pinStorageKey, folders: [], sessions: [] };
-  const pinnedFolderSet = useMemo(() => new Set(activePinPreferences.folders), [activePinPreferences.folders]);
+  const pinnedFolderSet = useMemo(() => pinnedSessionDirectoryKeys(activePinPreferences.folders, directoryIdentities), [activePinPreferences.folders, directoryIdentities]);
   const pinnedSessionSet = useMemo(() => new Set(activePinPreferences.sessions), [activePinPreferences.sessions]);
 
   const updatePins = useCallback((kind: "folders" | "sessions", key: string) => {
     setPinPreferences((current) => {
       const base = current.storageKey === pinStorageKey
         ? current
-        : { storageKey: pinStorageKey, ...readSessionPinPreferences(pinStorageKey) };
-      const values = new Set(base[kind]);
-      if (values.has(key)) values.delete(key);
-      else values.add(key);
-      const next = { ...base, [kind]: Array.from(values) };
+        : { storageKey: pinStorageKey, ...readSessionPinPreferences(pinStorageKey, sessionPinStorage) };
+      const values = new Set(base.sessions);
+      if (kind === "sessions") {
+        if (values.has(key)) values.delete(key);
+        else values.add(key);
+      }
+      const next = kind === "folders"
+        ? { ...base, folders: toggleFolderPins(base.folders, key, directoryIdentities) }
+        : { ...base, sessions: Array.from(values) };
       try {
         localStorage.setItem(pinStorageKey, JSON.stringify({ folders: next.folders, sessions: next.sessions }));
       } catch {
@@ -395,10 +387,9 @@ export function SessionManagementPage({
       }
       return next;
     });
-  }, [pinStorageKey]);
+  }, [pinStorageKey, directoryIdentities]);
 
-  const orderedSessionGroups = useMemo(() => groupedSessions.map(([group, items]) => {
-    const folderKey = normalizeFolderPinKey(items.find((item) => item.cwd)?.cwd);
+  const orderedSessionGroups = useMemo(() => mergeSessionDirectoryGroups(groupedSessions, directoryIdentities).map(({ group, folderKey, items }) => {
     const orderedItems = [...items].sort((left, right) => {
       const pinnedOrder = Number(pinnedSessionSet.has(right.id)) - Number(pinnedSessionSet.has(left.id));
       if (pinnedOrder) return pinnedOrder;
@@ -416,7 +407,7 @@ export function SessionManagementPage({
     if (!sessionGroupByCwd) return 0;
     const pinnedOrder = Number(right.pinned) - Number(left.pinned);
     return pinnedOrder || right.newestAt - left.newestAt || left.group.localeCompare(right.group);
-  }), [groupedSessions, pinnedFolderSet, pinnedSessionSet, sessionGroupByCwd]);
+  }), [groupedSessions, directoryIdentities, pinnedFolderSet, pinnedSessionSet, sessionGroupByCwd]);
 
   const orderedAllSessions = useMemo(() => [...filteredSessions].sort((left, right) => {
     const pinnedOrder = Number(pinnedSessionSet.has(right.id)) - Number(pinnedSessionSet.has(left.id));
@@ -434,7 +425,7 @@ export function SessionManagementPage({
 
   const displayedSessions = useMemo(() => {
     if (!sessionGroupByCwd || selectedFolderKey === SESSION_ALL_FOLDERS_KEY) return orderedAllSessions;
-    return orderedSessionGroups.find((group) => group.folderKey === selectedFolderKey)?.items || [];
+    return sessionsForDirectoryGroup(orderedSessionGroups, selectedFolderKey);
   }, [orderedAllSessions, orderedSessionGroups, selectedFolderKey, sessionGroupByCwd]);
   const selectedVisibleCount = displayedSessions.filter((item) => selectedSessionSet.has(item.id)).length;
   const allVisibleSelected = displayedSessions.length > 0 && selectedVisibleCount === displayedSessions.length;
@@ -712,7 +703,7 @@ export function SessionManagementPage({
                       <button
                         type="button"
                         className={cx("cx-session-pin-action", folder.pinned && "cx-session-pin-action--active")}
-                        onClick={() => updatePins("folders", folder.folderKey)}
+                        onClick={() => updatePins("folders", folder.items.find((item) => item.cwd)?.cwd || "")}
                         aria-label={folder.pinned ? copy.unpinFolder : copy.pinFolder}
                         title={folder.pinned ? copy.unpinFolder : copy.pinFolder}
                       >

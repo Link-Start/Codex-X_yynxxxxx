@@ -1,5 +1,6 @@
 use super::backup::{create_provider_sync_backup, prune_provider_sync_backups};
 use super::catalog::{scan_catalog_internal_thread_ids, scan_catalog_sync, CatalogSyncScan};
+use super::directory_identity::session_directory_identities;
 use super::storage::{
     current_model_provider, discover_sqlite_databases, ensure_sqlite_discovery_writable,
     list_session_previews_with_paths, rollout_internal_thread_ids, scan_provider_rollouts,
@@ -245,8 +246,12 @@ pub(super) fn session_sync_status_with_discovery(
         Err(error) => {
             let mut failures = scan.scan_failures.clone();
             failures.push(format!("无法读取当前活动会话列表: {error}"));
+            let (directory_identities, pin_scope_key) =
+                session_directory_identities(codex_dir, &[]);
             return Ok(SessionSyncStatus {
                 codex_dir: codex_dir.display().to_string(),
+                directory_identities,
+                pin_scope_key: Some(pin_scope_key),
                 target_provider: target,
                 rollout_files: scan.rollouts.rollout_files,
                 session_meta_count: scan.rollouts.session_meta_count,
@@ -287,8 +292,11 @@ pub(super) fn session_sync_status_with_discovery(
         || !scan.rollouts.mismatched_thread_ids.is_empty()
         || scan.sqlite.mismatched_threads > 0
         || scan.catalog.total_updates() > 0;
+    let (directory_identities, pin_scope_key) = session_directory_identities(codex_dir, &sessions);
     Ok(SessionSyncStatus {
         codex_dir: codex_dir.display().to_string(),
+        directory_identities,
+        pin_scope_key: Some(pin_scope_key),
         target_provider: target,
         rollout_files: scan.rollouts.rollout_files,
         session_meta_count: scan.rollouts.session_meta_count,

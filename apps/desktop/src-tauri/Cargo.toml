@@ -46,3 +46,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "time", "net"] }
 flate2 = "1"
 zstd = "0.13"
 tempfile = "3.27"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

@@ -2,6 +2,7 @@ mod app_server;
 mod backup;
 mod catalog;
 mod delete;
+mod directory_identity;
 mod export;
 mod global_state;
 mod rollout_stream;
