@@ -1,6 +1,8 @@
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, Serialize)]
@@ -60,6 +62,9 @@ pub(crate) struct RolloutScan {
     pub(crate) mismatched_session_meta: usize,
     pub(crate) changes: Vec<SessionFileChange>,
     pub(crate) provider_candidate_paths: HashSet<PathBuf>,
+    /// SHA-256 of every completely validated candidate's original JSONL. Keep
+    /// matched rollouts covered without retaining another copy of their text.
+    pub(crate) verified_rollout_hashes: HashMap<PathBuf, [u8; 32]>,
     pub(crate) cwd_by_thread_id: HashMap<String, String>,
     pub(crate) thread_ids: HashSet<String>,
     /// Non-user threads identified from their own rollout metadata. Retained
@@ -68,6 +73,9 @@ pub(crate) struct RolloutScan {
     pub(crate) mismatched_thread_ids: HashSet<String>,
     pub(crate) warnings: Vec<String>,
     pub(crate) scan_failures: Vec<String>,
+    /// Incomplete user-rollout scans that must block Provider/index mutations,
+    /// including unindexed files that would otherwise become only warnings.
+    pub(crate) blocked_failures: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +84,24 @@ pub(crate) struct SessionFileChange {
     pub(crate) original_text: String,
     pub(crate) next_text: String,
     pub(crate) original_mtime: Option<SystemTime>,
+    // Production snapshots live on disk; inline text is retained for small fixtures.
+    pub(super) streamed: Option<Arc<super::rollout_stream::StreamedSnapshot>>,
+}
+
+impl SessionFileChange {
+    pub(super) fn original_hash(&self) -> [u8; 32] {
+        self.streamed.as_ref().map_or_else(
+            || Sha256::digest(self.original_text.as_bytes()).into(),
+            |snapshot| snapshot.original_hash,
+        )
+    }
+
+    pub(super) fn next_hash(&self) -> [u8; 32] {
+        self.streamed.as_ref().map_or_else(
+            || Sha256::digest(self.next_text.as_bytes()).into(),
+            |snapshot| snapshot.next_hash,
+        )
+    }
 }
 
 #[derive(Debug, Default)]

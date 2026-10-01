@@ -4,6 +4,7 @@ mod catalog;
 mod delete;
 mod export;
 mod global_state;
+mod rollout_stream;
 mod storage;
 mod sync;
 mod transaction;

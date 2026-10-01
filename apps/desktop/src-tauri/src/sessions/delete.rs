@@ -1,24 +1,29 @@
 use super::app_server::delete_sessions_via_codex_app_server;
+use super::rollout_stream::{for_each_jsonl_record, record_matches_top_level_strings};
 use super::storage::{
     current_model_provider, discover_sqlite_databases, ensure_sqlite_discovery_writable,
     is_canonical_rollout_storage_path, rollout_filename_matches_id, scan_rollouts,
-    split_line_ending, sqlite_subagent_thread_ids, sqlite_thread_needs_alignment, SqliteDiscovery,
+    sqlite_subagent_thread_ids, sqlite_thread_needs_alignment, SqliteDiscovery,
     SqliteThreadIndexState,
 };
 use super::sync::{acquire_session_maintenance_lock, session_sync_status_with_discovery};
 use super::types::SessionSyncStatus;
 use crate::error::{CodexxError, Result};
-use crate::file_io::{io_err, write_text};
+use crate::file_io::io_err;
 use crate::resolve_codex_dir;
 use crate::sqlite_utils::{sql_select_column, sqlite_has_table, table_column_set};
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+use tempfile::NamedTempFile;
+
+#[cfg(test)]
+use super::storage::hash_rollout_file;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -481,54 +486,401 @@ fn selected_rollout_paths(
     Ok(paths)
 }
 
+const CLEANUP_IO_BUFFER_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CleanupFileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+    created: Option<SystemTime>,
+    unix_identity: Option<(u64, u64)>,
+}
+
+impl CleanupFileStamp {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let unix_identity = {
+            use std::os::unix::fs::MetadataExt;
+            Some((metadata.dev(), metadata.ino()))
+        };
+        #[cfg(not(unix))]
+        let unix_identity = None;
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+            unix_identity,
+        }
+    }
+}
+
+struct CleanupHashingReader<'a> {
+    source: &'a mut fs::File,
+    backup: Option<&'a mut fs::File>,
+    digest: &'a mut Sha256,
+    consumed: u64,
+}
+
+impl Read for CleanupHashingReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.source.read(bytes)?;
+        if let Some(backup) = self.backup.as_mut() {
+            backup.write_all(&bytes[..count])?;
+        }
+        self.digest.update(&bytes[..count]);
+        self.consumed += count as u64;
+        Ok(count)
+    }
+}
+
+fn copy_cleanup_bytes(reader: &mut impl Read, writer: &mut impl Write) -> std::io::Result<u64> {
+    let mut bytes = [0u8; CLEANUP_IO_BUFFER_BYTES];
+    let mut copied = 0u64;
+    loop {
+        let count = reader.read(&mut bytes)?;
+        if count == 0 {
+            return Ok(copied);
+        }
+        writer.write_all(&bytes[..count])?;
+        copied += count as u64;
+    }
+}
+
+fn filter_cleanup_records<R: Read, W: Write>(
+    reader: R,
+    writer: &mut W,
+    path: &Path,
+    id_keys: &[&str],
+    session_ids: &HashSet<String>,
+) -> Result<usize> {
+    let mut removed = 0usize;
+    for_each_jsonl_record(reader, |record, _| {
+        record
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| io_err(path, error))?;
+        let matches = if session_ids.is_empty() {
+            false
+        } else {
+            match record_matches_top_level_strings(record, id_keys, session_ids, 128) {
+                Ok(matches) => matches,
+                Err(error @ CodexxError::Io { .. }) => return Err(error),
+                // Invalid JSON is preserved exactly as in the previous filter.
+                Err(_) => false,
+            }
+        };
+        if matches {
+            removed += 1;
+        } else {
+            record
+                .seek(SeekFrom::Start(0))
+                .map_err(|error| io_err(path, error))?;
+            copy_cleanup_bytes(record, writer).map_err(|error| io_err(path, error))?;
+        }
+        Ok(())
+    })?;
+    Ok(removed)
+}
+
+struct PreparedJsonlCleanup {
+    output: NamedTempFile,
+    original_backup: Option<NamedTempFile>,
+    original_stamp: CleanupFileStamp,
+    original_hash: [u8; 32],
+    removed: usize,
+}
+
+fn cleanup_source_changed(path: &Path) -> CodexxError {
+    CodexxError::Config(format!(
+        "会话索引或历史记录在清理期间发生变化，已取消替换: {}",
+        path.display()
+    ))
+}
+
+fn hash_open_cleanup_file(path: &Path, source: &fs::File) -> Result<[u8; 32]> {
+    // Read the existing handle: an exclusive history lock can reject a second
+    // handle's read on Windows, even when it is opened by this same process.
+    let mut reader = source;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| io_err(path, error))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; CLEANUP_IO_BUFFER_BYTES];
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| io_err(path, error))?;
+        if count == 0 {
+            return Ok(digest.finalize().into());
+        }
+        digest.update(&buffer[..count]);
+    }
+}
+
+fn ensure_cleanup_source_unchanged(
+    path: &Path,
+    source: &fs::File,
+    stamp: &CleanupFileStamp,
+    hash: &[u8; 32],
+) -> Result<()> {
+    let source_stamp = || -> Result<CleanupFileStamp> {
+        source
+            .metadata()
+            .map(|metadata| CleanupFileStamp::from_metadata(&metadata))
+            .map_err(|error| io_err(path, error))
+    };
+    let path_stamp = || -> Result<CleanupFileStamp> {
+        fs::metadata(path)
+            .map(|metadata| CleanupFileStamp::from_metadata(&metadata))
+            .map_err(|error| io_err(path, error))
+    };
+    if &source_stamp()? != stamp || &path_stamp()? != stamp {
+        return Err(cleanup_source_changed(path));
+    }
+    if &hash_open_cleanup_file(path, source)? != hash
+        || &source_stamp()? != stamp
+        || &path_stamp()? != stamp
+    {
+        return Err(cleanup_source_changed(path));
+    }
+    Ok(())
+}
+
+fn prepare_jsonl_cleanup(
+    path: &Path,
+    source: &mut fs::File,
+    id_keys: &[&str],
+    session_ids: &HashSet<String>,
+    retain_backup: bool,
+) -> Result<PreparedJsonlCleanup> {
+    let metadata = source.metadata().map_err(|error| io_err(path, error))?;
+    if !metadata.is_file() {
+        return Err(CodexxError::Config(format!(
+            "会话日志不是普通文件: {}",
+            path.display()
+        )));
+    }
+    let original_stamp = CleanupFileStamp::from_metadata(&metadata);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut output = NamedTempFile::new_in(parent).map_err(|error| io_err(path, error))?;
+    let mut original_backup = if retain_backup {
+        Some(NamedTempFile::new_in(parent).map_err(|error| io_err(path, error))?)
+    } else {
+        None
+    };
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| io_err(path, error))?;
+    let mut digest = Sha256::new();
+    let mut reader = CleanupHashingReader {
+        source: &mut *source,
+        backup: original_backup.as_mut().map(NamedTempFile::as_file_mut),
+        digest: &mut digest,
+        consumed: 0,
+    };
+    let removed = filter_cleanup_records(
+        &mut reader,
+        output.as_file_mut(),
+        path,
+        id_keys,
+        session_ids,
+    )?;
+    let consumed = reader.consumed;
+    drop(reader);
+    if consumed != original_stamp.len
+        || CleanupFileStamp::from_metadata(&source.metadata().map_err(|error| io_err(path, error))?)
+            != original_stamp
+    {
+        return Err(cleanup_source_changed(path));
+    }
+    output
+        .as_file()
+        .sync_all()
+        .map_err(|error| io_err(path, error))?;
+    if let Some(backup) = original_backup.as_ref() {
+        backup
+            .as_file()
+            .sync_all()
+            .map_err(|error| io_err(path, error))?;
+    }
+    let original_hash = digest.finalize().into();
+    ensure_cleanup_source_unchanged(path, source, &original_stamp, &original_hash)?;
+    Ok(PreparedJsonlCleanup {
+        output,
+        original_backup,
+        original_stamp,
+        original_hash,
+        removed,
+    })
+}
+
+fn preflight_session_jsonl_cleanup(codex_dir: &Path) -> Result<()> {
+    // Framing and staging use fixed memory even for a very large valid history.
+    // Read/write failures still occur before the irreversible deletion API.
+    for filename in ["session_index.jsonl", "history.jsonl"] {
+        let path = codex_dir.join(filename);
+        let mut source = match fs::File::open(&path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_err(&path, error)),
+        };
+        prepare_jsonl_cleanup(&path, &mut source, &[], &HashSet::new(), false)?;
+    }
+    Ok(())
+}
+
+fn commit_index_cleanup(
+    path: &Path,
+    source: &fs::File,
+    prepared: PreparedJsonlCleanup,
+) -> Result<usize> {
+    if prepared.removed == 0 {
+        return Ok(0);
+    }
+    ensure_cleanup_source_unchanged(
+        path,
+        source,
+        &prepared.original_stamp,
+        &prepared.original_hash,
+    )?;
+    let permissions = source
+        .metadata()
+        .map_err(|error| io_err(path, error))?
+        .permissions();
+    prepared
+        .output
+        .as_file()
+        .set_permissions(permissions)
+        .map_err(|error| io_err(path, error))?;
+    prepared
+        .output
+        .persist(path)
+        .map_err(|error| io_err(path, error.error))?;
+    Ok(prepared.removed)
+}
+
 fn remove_jsonl_session_entries(
     path: &Path,
     id_keys: &[&str],
     session_ids: &HashSet<String>,
 ) -> Result<usize> {
-    if !path.exists() {
-        return Ok(0);
-    }
-    let text = fs::read_to_string(path).map_err(|e| io_err(path, e))?;
-    let (next, removed) = filter_jsonl_session_entries(&text, id_keys, session_ids);
-    if removed > 0 {
-        write_text(path, &next)?;
-    }
-    Ok(removed)
-}
-
-fn filter_jsonl_session_entries(
-    text: &str,
-    id_keys: &[&str],
-    session_ids: &HashSet<String>,
-) -> (String, usize) {
-    let mut next = String::with_capacity(text.len());
-    let mut removed = 0usize;
-    for segment in text.split_inclusive('\n') {
-        let (line, ending) = split_line_ending(segment);
-        let matches = serde_json::from_str::<Value>(line)
-            .ok()
-            .and_then(|value| {
-                id_keys.iter().find_map(|key| {
-                    value
-                        .get(*key)
-                        .and_then(Value::as_str)
-                        .map(ToString::to_string)
-                })
-            })
-            .is_some_and(|id| session_ids.contains(&id));
-        if matches {
-            removed += 1;
-        } else {
-            next.push_str(line);
-            next.push_str(ending);
-        }
-    }
-    (next, removed)
+    let mut source = match fs::File::open(path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(io_err(path, error)),
+    };
+    let prepared = prepare_jsonl_cleanup(path, &mut source, id_keys, session_ids, false)?;
+    commit_index_cleanup(path, &source, prepared)
 }
 
 fn remove_session_index_entries(codex_dir: &Path, session_ids: &HashSet<String>) -> Result<usize> {
     remove_jsonl_session_entries(&codex_dir.join("session_index.jsonl"), &["id"], session_ids)
+}
+
+fn restore_history_backup(
+    path: &Path,
+    source: &mut fs::File,
+    backup: &mut fs::File,
+    original_len: u64,
+    original_hash: &[u8; 32],
+) -> Result<()> {
+    backup
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| io_err(path, error))?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| io_err(path, error))?;
+    if copy_cleanup_bytes(backup, source).map_err(|error| io_err(path, error))? != original_len {
+        return Err(CodexxError::Config(
+            "历史记录备份不完整，无法安全回滚".into(),
+        ));
+    }
+    // Filtering never grows the file. Replaying the complete backup restores its
+    // original length after a failed truncate, and does not truncate a later
+    // append beyond the original EOF from a writer that ignored the lock.
+    source.sync_all().map_err(|error| io_err(path, error))?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| io_err(path, error))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; CLEANUP_IO_BUFFER_BYTES];
+    let mut remaining = original_len;
+    while remaining > 0 {
+        let allowed = buffer.len().min(remaining as usize);
+        let count = source
+            .read(&mut buffer[..allowed])
+            .map_err(|error| io_err(path, error))?;
+        if count == 0 {
+            return Err(CodexxError::Config("历史记录回滚后长度不足".into()));
+        }
+        digest.update(&buffer[..count]);
+        remaining -= count as u64;
+    }
+    let restored: [u8; 32] = digest.finalize().into();
+    if &restored != original_hash {
+        return Err(CodexxError::Config("历史记录回滚校验失败".into()));
+    }
+    Ok(())
+}
+
+fn commit_history_cleanup_with_writer<F>(
+    path: &Path,
+    source: &mut fs::File,
+    mut prepared: PreparedJsonlCleanup,
+    write_output: F,
+) -> Result<usize>
+where
+    F: FnOnce(&mut fs::File, &mut fs::File, u64, u64) -> Result<()>,
+{
+    if prepared.removed == 0 {
+        return Ok(0);
+    }
+    ensure_cleanup_source_unchanged(
+        path,
+        source,
+        &prepared.original_stamp,
+        &prepared.original_hash,
+    )?;
+    let output_len = prepared
+        .output
+        .as_file()
+        .metadata()
+        .map_err(|error| io_err(path, error))?
+        .len();
+    if output_len > prepared.original_stamp.len {
+        return Err(CodexxError::Config(
+            "历史记录过滤结果异常，未写入原文件".into(),
+        ));
+    }
+    let mut backup = prepared
+        .original_backup
+        .take()
+        .ok_or_else(|| CodexxError::Config("历史记录缺少完整磁盘备份，未写入原文件".into()))?;
+    if let Err(error) = write_output(
+        source,
+        prepared.output.as_file_mut(),
+        output_len,
+        prepared.original_stamp.len,
+    ) {
+        if let Err(restore_error) = restore_history_backup(
+            path,
+            source,
+            backup.as_file_mut(),
+            prepared.original_stamp.len,
+            &prepared.original_hash,
+        ) {
+            return match backup.keep() {
+                Ok((_, retained)) => Err(CodexxError::Config(format!(
+                    "{error}；历史记录回滚失败：{restore_error}；已保留私有备份：{}",
+                    retained.display()
+                ))),
+                Err(keep_error) => Err(CodexxError::Config(format!(
+                    "{error}；历史记录回滚失败：{restore_error}；保留备份失败：{keep_error}"
+                ))),
+            };
+        }
+        return Err(error);
+    }
+    Ok(prepared.removed)
 }
 
 fn remove_session_history_entries(
@@ -536,33 +888,45 @@ fn remove_session_history_entries(
     session_ids: &HashSet<String>,
 ) -> Result<usize> {
     let path = codex_dir.join("history.jsonl");
-    if !path.exists() {
-        return Ok(0);
-    }
-    let mut file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .map_err(|e| io_err(&path, e))?;
+    let mut file = match fs::OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(io_err(&path, error)),
+    };
     file.try_lock().map_err(|error| {
         CodexxError::Config(format!(
             "历史记录正在被其他 Codex 进程使用，请关闭相关 Codex 窗口或 CLI 后重试: {error}"
         ))
     })?;
     let result = (|| -> Result<usize> {
-        let mut text = String::new();
-        file.read_to_string(&mut text)
-            .map_err(|e| io_err(&path, e))?;
-        let (next, removed) = filter_jsonl_session_entries(&text, &["session_id"], session_ids);
-        if removed > 0 {
-            file.set_len(0).map_err(|e| io_err(&path, e))?;
-            file.seek(SeekFrom::Start(0))
-                .map_err(|e| io_err(&path, e))?;
-            file.write_all(next.as_bytes())
-                .map_err(|e| io_err(&path, e))?;
-            file.sync_all().map_err(|e| io_err(&path, e))?;
-        }
-        Ok(removed)
+        let prepared = prepare_jsonl_cleanup(&path, &mut file, &["session_id"], session_ids, true)?;
+        commit_history_cleanup_with_writer(
+            &path,
+            &mut file,
+            prepared,
+            |source, output, output_len, original_len| {
+                output
+                    .seek(SeekFrom::Start(0))
+                    .map_err(|error| io_err(&path, error))?;
+                source
+                    .seek(SeekFrom::Start(0))
+                    .map_err(|error| io_err(&path, error))?;
+                copy_cleanup_bytes(output, source).map_err(|error| io_err(&path, error))?;
+                if source
+                    .metadata()
+                    .map_err(|error| io_err(&path, error))?
+                    .len()
+                    != original_len
+                {
+                    return Err(cleanup_source_changed(&path));
+                }
+                source
+                    .set_len(output_len)
+                    .map_err(|error| io_err(&path, error))?;
+                source.sync_all().map_err(|error| io_err(&path, error))?;
+                Ok(())
+            },
+        )
     })();
     let _ = file.unlock();
     result
@@ -787,6 +1151,7 @@ pub(crate) fn hard_delete_sessions_locally(
     let relationship_sources = relationship_database_sources(&discovery, roots)?;
     let session_ids = session_ids_with_descendants(&relationship_sources, roots)?;
     let rollout_paths = selected_rollout_paths(codex_dir, &discovery.thread_paths, &session_ids)?;
+    preflight_session_jsonl_cleanup(codex_dir)?;
     Ok(delete_exact_session_ids_locally(
         codex_dir,
         &discovery.related_paths,
@@ -834,6 +1199,7 @@ pub(crate) fn delete_codex_sessions_inner(
     // make the deletion irreversible.
     let expected_rollout_paths =
         selected_rollout_paths(&codex_dir, &discovery.thread_paths, &expected_ids)?;
+    preflight_session_jsonl_cleanup(&codex_dir)?;
     let mut counts = LocalSessionDeleteCounts::default();
     let mut failed_roots = Vec::new();
 
@@ -1120,5 +1486,418 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn unreadable_cleanup_logs_cancel_native_and_local_deletion_before_any_mutation() {
+        for filename in ["session_index.jsonl", "history.jsonl"] {
+            let codex_dir = temp_codex_dir();
+            let id = "019f6000-0000-7000-8000-000000000371";
+            let database = codex_dir.join("state_10.sqlite");
+            create_thread_database(&database, id);
+            let rollout = codex_dir.join(format!("sessions/rollout-test-{id}.jsonl"));
+            fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+            let rollout_text = format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"model_provider\":\"openai\"}}}}\n"
+            );
+            fs::write(&rollout, &rollout_text).unwrap();
+            for (name, key) in [
+                ("session_index.jsonl", "id"),
+                ("history.jsonl", "session_id"),
+            ] {
+                fs::write(codex_dir.join(name), format!("{{\"{key}\":\"{id}\"}}\n")).unwrap();
+            }
+            let unreadable = codex_dir.join(filename);
+            fs::remove_file(&unreadable).unwrap();
+            fs::create_dir(&unreadable).unwrap();
+            let database_before = fs::read(&database).unwrap();
+            let untouched_name = if filename == "history.jsonl" {
+                "session_index.jsonl"
+            } else {
+                "history.jsonl"
+            };
+            let untouched_path = codex_dir.join(untouched_name);
+            let untouched_before = fs::read(&untouched_path).unwrap();
+
+            let local_error = hard_delete_sessions_locally(&codex_dir, &[id.to_string()])
+                .expect_err("local deletion must reject an unreadable cleanup log");
+            assert!(local_error.to_string().contains(filename));
+            let native_error = delete_codex_sessions_inner(SessionDeleteInput {
+                config_dir: Some(codex_dir.display().to_string()),
+                session_ids: vec![id.to_string()],
+            })
+            .expect_err("native deletion must stop at preflight before starting Codex");
+            assert!(native_error.to_string().contains(filename));
+
+            assert_eq!(fs::read(&rollout).unwrap(), rollout_text.as_bytes());
+            assert_eq!(fs::read(&database).unwrap(), database_before);
+            assert_eq!(fs::read(&untouched_path).unwrap(), untouched_before);
+            assert!(unreadable.is_dir());
+            let present =
+                active_session_ids_present(&[database], &HashSet::from([id.to_string()])).unwrap();
+            assert!(present.contains(id));
+            fs::remove_dir_all(codex_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn large_cleanup_logs_stream_without_a_total_size_limit() {
+        for filename in ["session_index.jsonl", "history.jsonl"] {
+            let codex_dir = temp_codex_dir();
+            let id = "019f6000-0000-7000-8000-000000000381";
+            let database = codex_dir.join("state_10.sqlite");
+            create_thread_database(&database, id);
+            let rollout = codex_dir.join(format!("sessions/rollout-test-{id}.jsonl"));
+            fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+            fs::write(&rollout, format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"model_provider\":\"openai\"}}}}\n")).unwrap();
+            let path = codex_dir.join(filename);
+            let key = if filename == "history.jsonl" {
+                "session_id"
+            } else {
+                "id"
+            };
+            let remove_large_record = filename == "history.jsonl";
+            let mut file = fs::File::create(&path).unwrap();
+            let large_id = if remove_large_record { id } else { "kept" };
+            let prefix = format!("{{\"{key}\":\"{large_id}\",\"text\":\"");
+            let mut expected = Sha256::new();
+            file.write_all(prefix.as_bytes()).unwrap();
+            if !remove_large_record {
+                expected.update(prefix.as_bytes());
+            }
+            let bytes = [b'x'; CLEANUP_IO_BUFFER_BYTES];
+            for _ in 0..(33 * 1024 * 1024 / CLEANUP_IO_BUFFER_BYTES) {
+                file.write_all(&bytes).unwrap();
+                if !remove_large_record {
+                    expected.update(bytes);
+                }
+            }
+            file.write_all(b"\"}\r\n").unwrap();
+            if !remove_large_record {
+                expected.update(b"\"}\r\n");
+                file.write_all(format!("{{\"{key}\":\"{id}\"}}\n").as_bytes())
+                    .unwrap();
+            }
+            let tail = format!("not-json\r\n{{\"{key}\":\"{id}\",\"{key}\":\"kept-last\"}}\n{{\"{key}\":\"kept-final\"}}");
+            file.write_all(tail.as_bytes()).unwrap();
+            expected.update(tail.as_bytes());
+            drop(file);
+            assert!(fs::metadata(&path).unwrap().len() > 32 * 1024 * 1024);
+            let other_name = if filename == "history.jsonl" {
+                "session_index.jsonl"
+            } else {
+                "history.jsonl"
+            };
+            let other_key = if key == "id" { "session_id" } else { "id" };
+            fs::write(
+                codex_dir.join(other_name),
+                format!("{{\"{other_key}\":\"{id}\"}}\r\n{{\"{other_key}\":\"untouched\"}}"),
+            )
+            .unwrap();
+            preflight_session_jsonl_cleanup(&codex_dir)
+                .expect("large valid logs must pass streaming preflight");
+            let result = hard_delete_sessions_locally(&codex_dir, &[id.to_string()]).unwrap();
+            assert!(result.errors.is_empty(), "{:?}", result.errors);
+            assert!(!rollout.exists());
+            assert!(
+                !active_session_ids_present(&[database], &HashSet::from([id.to_string()]))
+                    .unwrap()
+                    .contains(id)
+            );
+            let expected_hash: [u8; 32] = expected.finalize().into();
+            assert_eq!(hash_rollout_file(&path).unwrap(), expected_hash);
+            assert_eq!(
+                fs::read(codex_dir.join(other_name)).unwrap(),
+                format!("{{\"{other_key}\":\"untouched\"}}").as_bytes()
+            );
+            fs::remove_dir_all(codex_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn streaming_cleanup_preserves_missing_files_and_normal_jsonl_filtering() {
+        let codex_dir = temp_codex_dir();
+        preflight_session_jsonl_cleanup(&codex_dir).unwrap();
+        assert!(!codex_dir.join("session_index.jsonl").exists());
+        assert!(!codex_dir.join("history.jsonl").exists());
+        let ids = HashSet::from(["selected".to_string()]);
+        for (filename, key) in [
+            ("session_index.jsonl", "id"),
+            ("history.jsonl", "session_id"),
+        ] {
+            fs::write(
+                codex_dir.join(filename),
+                format!("{{\"{key}\":\"selected\"}}\r\nnot-json\r\n{{\"{key}\":\"kept\"}}"),
+            )
+            .unwrap();
+        }
+        preflight_session_jsonl_cleanup(&codex_dir).unwrap();
+        assert_eq!(remove_session_index_entries(&codex_dir, &ids).unwrap(), 1);
+        assert_eq!(remove_session_history_entries(&codex_dir, &ids).unwrap(), 1);
+        for (filename, key) in [
+            ("session_index.jsonl", "id"),
+            ("history.jsonl", "session_id"),
+        ] {
+            assert_eq!(
+                fs::read_to_string(codex_dir.join(filename)).unwrap(),
+                format!("not-json\r\n{{\"{key}\":\"kept\"}}")
+            );
+        }
+        fs::remove_dir_all(codex_dir).unwrap();
+    }
+
+    #[test]
+    fn streaming_cleanup_only_matches_valid_top_level_ids_and_preserves_other_bytes() {
+        let codex_dir = temp_codex_dir();
+        let path = codex_dir.join("session_index.jsonl");
+        let kept = b"not-json\r\n{\"nested\":{\"id\":\"selected\"},\"id\":\"kept\"}\n{\"id\":\"selected\",\"id\":null}\r\n\xff\n";
+        let mut original = kept.to_vec();
+        original.extend_from_slice(b"{\"id\":\"selected\"}\r\n");
+        original.extend_from_slice(b"{\"id\":\"last-kept\"}");
+        fs::write(&path, original).unwrap();
+        assert_eq!(
+            remove_session_index_entries(&codex_dir, &HashSet::from(["selected".to_string()]))
+                .unwrap(),
+            1
+        );
+        let mut expected = kept.to_vec();
+        expected.extend_from_slice(b"{\"id\":\"last-kept\"}");
+        assert_eq!(fs::read(path).unwrap(), expected);
+        fs::remove_dir_all(codex_dir).unwrap();
+    }
+
+    struct FailingCleanupRead<R> {
+        inner: R,
+        remaining: usize,
+    }
+    impl<R: Read> Read for FailingCleanupRead<R> {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::other("injected cleanup read failure"));
+            }
+            let allowed = bytes.len().min(self.remaining);
+            let count = self.inner.read(&mut bytes[..allowed])?;
+            self.remaining -= count;
+            Ok(count)
+        }
+    }
+
+    struct FailingCleanupWrite<W> {
+        inner: W,
+        remaining: usize,
+    }
+    impl<W: Write> Write for FailingCleanupWrite<W> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::other("injected cleanup write failure"));
+            }
+            let count = self
+                .inner
+                .write(&bytes[..bytes.len().min(self.remaining)])?;
+            self.remaining -= count;
+            Ok(count)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    #[test]
+    fn streaming_cleanup_read_or_staging_write_failure_preserves_the_source() {
+        let codex_dir = temp_codex_dir();
+        let path = codex_dir.join("session_index.jsonl");
+        let original = b"{\"id\":\"kept\",\"text\":\"retained\"}\r\n{\"id\":\"selected\"}\n";
+        fs::write(&path, original).unwrap();
+        let ids = HashSet::from(["selected".to_string()]);
+        let mut target = NamedTempFile::new_in(&codex_dir).unwrap();
+        let error = filter_cleanup_records(
+            FailingCleanupRead {
+                inner: fs::File::open(&path).unwrap(),
+                remaining: 7,
+            },
+            target.as_file_mut(),
+            &path,
+            &["id"],
+            &ids,
+        )
+        .expect_err("read errors must propagate, not become a malformed record");
+        assert!(matches!(error, CodexxError::Io { .. }));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let mut writer = FailingCleanupWrite {
+            inner: target.as_file_mut(),
+            remaining: 3,
+        };
+        let error = filter_cleanup_records(
+            fs::File::open(&path).unwrap(),
+            &mut writer,
+            &path,
+            &["id"],
+            &ids,
+        )
+        .expect_err("a failed private output must never be installed");
+        assert!(matches!(error, CodexxError::Io { .. }));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        drop(target);
+        fs::remove_dir_all(codex_dir).unwrap();
+    }
+
+    #[test]
+    fn staged_cleanup_detects_growth_before_index_or_history_commit() {
+        for history in [false, true] {
+            let codex_dir = temp_codex_dir();
+            let path = codex_dir.join(if history {
+                "history.jsonl"
+            } else {
+                "session_index.jsonl"
+            });
+            let key = if history { "session_id" } else { "id" };
+            fs::write(
+                &path,
+                format!("{{\"{key}\":\"selected\"}}\n{{\"{key}\":\"kept\"}}\n"),
+            )
+            .unwrap();
+            let mut source = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let prepared = prepare_jsonl_cleanup(
+                &path,
+                &mut source,
+                &[key],
+                &HashSet::from(["selected".to_string()]),
+                history,
+            )
+            .unwrap();
+            let mut external = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            external
+                .write_all(format!("{{\"{key}\":\"new-append\"}}\n").as_bytes())
+                .unwrap();
+            external.sync_all().unwrap();
+            drop(external);
+            let grown = fs::read(&path).unwrap();
+            let result = if history {
+                commit_history_cleanup_with_writer(&path, &mut source, prepared, |_, _, _, _| {
+                    panic!("growth must be rejected before writing history")
+                })
+            } else {
+                commit_index_cleanup(&path, &source, prepared)
+            };
+            assert!(result
+                .expect_err("a stale staged result must not replace appended data")
+                .to_string()
+                .contains("发生变化"));
+            assert_eq!(fs::read(&path).unwrap(), grown);
+            drop(source);
+            fs::remove_dir_all(codex_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn history_commit_write_failure_restores_backup_and_keeps_its_lock_and_inode() {
+        for fail_after_truncate in [false, true] {
+            let codex_dir = temp_codex_dir();
+            let path = codex_dir.join("history.jsonl");
+            let original = b"{\"session_id\":\"selected\",\"text\":\"private fixture\"}\r\n{\"session_id\":\"kept\"}";
+            fs::write(&path, original).unwrap();
+            let before = CleanupFileStamp::from_metadata(&fs::metadata(&path).unwrap());
+            let mut source = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            source.try_lock().unwrap();
+            let probe = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            assert!(probe.try_lock().is_err());
+            let prepared = prepare_jsonl_cleanup(
+                &path,
+                &mut source,
+                &["session_id"],
+                &HashSet::from(["selected".to_string()]),
+                true,
+            )
+            .unwrap();
+            let error = commit_history_cleanup_with_writer(
+                &path,
+                &mut source,
+                prepared,
+                |source, output, output_len, _| {
+                    source.seek(SeekFrom::Start(0)).unwrap();
+                    output.seek(SeekFrom::Start(0)).unwrap();
+                    if fail_after_truncate {
+                        copy_cleanup_bytes(output, source).unwrap();
+                        source.set_len(output_len).unwrap();
+                    } else {
+                        source.write_all(b"partial failed write").unwrap();
+                    }
+                    Err(io_err(
+                        &path,
+                        std::io::Error::other("injected commit write/sync failure"),
+                    ))
+                },
+            )
+            .expect_err("failed commit must report the failure after restoring the disk backup");
+            assert!(error.to_string().contains("injected commit"));
+            let expected_hash: [u8; 32] = Sha256::digest(original).into();
+            assert_eq!(
+                hash_open_cleanup_file(&path, &source).unwrap(),
+                expected_hash
+            );
+            assert_eq!(source.metadata().unwrap().len(), original.len() as u64);
+            assert_eq!(
+                CleanupFileStamp::from_metadata(&source.metadata().unwrap()).unix_identity,
+                before.unix_identity
+            );
+            assert!(
+                probe.try_lock().is_err(),
+                "rollback must not release the live history lock"
+            );
+            source.unlock().unwrap();
+            assert!(probe.try_lock().is_ok());
+            probe.unlock().unwrap();
+            drop(probe);
+            drop(source);
+            assert_eq!(fs::read(&path).unwrap(), original);
+            fs::remove_dir_all(codex_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn successful_history_cleanup_keeps_an_already_open_append_handle_usable() {
+        let codex_dir = temp_codex_dir();
+        let path = codex_dir.join("history.jsonl");
+        fs::write(
+            &path,
+            b"{\"session_id\":\"selected\"}\n{\"session_id\":\"kept\"}\n",
+        )
+        .unwrap();
+        let before = CleanupFileStamp::from_metadata(&fs::metadata(&path).unwrap());
+        let mut old_append_handle = fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        assert_eq!(
+            remove_session_history_entries(&codex_dir, &HashSet::from(["selected".to_string()]))
+                .unwrap(),
+            1
+        );
+        old_append_handle.try_lock().unwrap();
+        old_append_handle
+            .write_all(b"{\"session_id\":\"later\"}\r\n")
+            .unwrap();
+        old_append_handle.unlock().unwrap();
+        drop(old_append_handle);
+        let after = CleanupFileStamp::from_metadata(&fs::metadata(&path).unwrap());
+        assert_eq!(after.unix_identity, before.unix_identity);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"{\"session_id\":\"kept\"}\n{\"session_id\":\"later\"}\r\n"
+        );
+        fs::remove_dir_all(codex_dir).unwrap();
     }
 }

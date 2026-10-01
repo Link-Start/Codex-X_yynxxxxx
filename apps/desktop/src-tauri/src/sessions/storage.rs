@@ -1,22 +1,38 @@
 use super::global_state::normalize_workspace_path;
+use super::rollout_stream::{read_first_meta, scan_rollout_stream};
 use super::types::{RolloutScan, SessionFileChange, SessionPreview, SqliteScan};
 use crate::error::{CodexxError, Result};
-use crate::file_io::{
-    atomic_write, io_err, json_err, parse_toml_document, read_to_string_if_exists,
-};
+use crate::file_io::{io_err, parse_toml_document, read_to_string_if_exists};
 use crate::paths::home_dir;
 use crate::sqlite_utils::{sql_select_column, sqlite_has_table, table_column_set};
 use crate::{config_path, string_value};
 use rusqlite::{Connection, OpenFlags};
-use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufReader, Read};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use toml_edit::DocumentMut;
+
+/// Digest without retaining log contents, regardless of file or record size.
+pub(super) fn hash_rollout_file(path: &Path) -> std::io::Result<[u8; 32]> {
+    hash_reader(fs::File::open(path)?)
+}
+
+fn hash_reader<R: Read>(mut reader: R) -> std::io::Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher.finalize().into())
+}
 
 pub(super) fn current_model_provider(codex_dir: &Path, explicit: Option<String>) -> Result<String> {
     if let Some(provider) = explicit
@@ -183,16 +199,6 @@ fn collect_rollout_paths(root: &Path, out: &mut Vec<PathBuf>, failures: &mut Vec
     }
 }
 
-pub(super) fn split_line_ending(segment: &str) -> (&str, &str) {
-    if let Some(line) = segment.strip_suffix("\r\n") {
-        (line, "\r\n")
-    } else if let Some(line) = segment.strip_suffix('\n') {
-        (line, "\n")
-    } else {
-        (segment, "")
-    }
-}
-
 fn is_locked_io_error(error: &std::io::Error) -> bool {
     matches!(error.kind(), std::io::ErrorKind::PermissionDenied)
         || matches!(error.raw_os_error(), Some(32 | 33))
@@ -301,7 +307,17 @@ fn scan_rollouts_with_thread_filter(
             .canonicalize()
             .ok()
             .and_then(|canonical| referenced.get(&canonical));
-        let identity = match read_rollout_identity(&path) {
+        let mut rollout_file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                scan.scan_failures.push(format!(
+                    "无法读取会话文件来源信息: {} ({error})",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        let identity = match read_rollout_identity_from_reader(&mut rollout_file, &path) {
             Ok(identity) => identity,
             Err(failure) => {
                 scan.scan_failures.push(failure);
@@ -329,156 +345,56 @@ fn scan_rollouts_with_thread_filter(
                 continue;
             }
         }
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) => {
-                let reason = if is_locked_io_error(&error) {
-                    "会话文件被占用或无权限读取"
-                } else {
-                    "无法读取会话文件"
-                };
-                scan.scan_failures
-                    .push(format!("{reason}: {} ({error})", path.display()));
-                continue;
-            }
-        };
-        let mut next_text = String::with_capacity(text.len());
-        let mut rewrite_needed = false;
-        let mut file_session_meta_count = 0usize;
-        let mut file_mismatched_session_meta = 0usize;
-        let mut invalid_json_lines = 0usize;
-        let mut invalid_session_meta = 0usize;
-        let mut thread_id = None;
-        let mut cwd = None;
-        let mut is_subagent = false;
-
-        for segment in text.split_inclusive('\n') {
-            let (line, line_ending) = split_line_ending(segment);
-            let mut next_line = line.to_string();
-            if !line.trim().is_empty() {
-                if let Ok(mut record) = serde_json::from_str::<Value>(line) {
-                    if record.get("type").and_then(Value::as_str) == Some("session_meta") {
-                        if let Some(payload) =
-                            record.get_mut("payload").and_then(Value::as_object_mut)
-                        {
-                            file_session_meta_count += 1;
-                            if file_session_meta_count == 1 {
-                                thread_id = payload
-                                    .get("id")
-                                    .and_then(Value::as_str)
-                                    .map(ToString::to_string);
-                                cwd = payload
-                                    .get("cwd")
-                                    .and_then(Value::as_str)
-                                    .and_then(normalize_workspace_path);
-                                is_subagent =
-                                    payload.get("source").is_some_and(source_value_is_subagent)
-                                        || payload
-                                            .get("thread_source")
-                                            .and_then(Value::as_str)
-                                            .is_some_and(thread_source_is_internal);
-                            }
-                            if payload.get("model_provider").and_then(Value::as_str)
-                                != Some(target_provider)
-                            {
-                                payload.insert(
-                                    "model_provider".to_string(),
-                                    Value::String(target_provider.to_string()),
-                                );
-                                next_line = serde_json::to_string(&record)
-                                    .map_err(|error| json_err(&path, error))?;
-                                rewrite_needed = true;
-                                file_mismatched_session_meta += 1;
-                            }
-                        } else {
-                            invalid_session_meta += 1;
-                        }
-                    }
-                } else {
-                    invalid_json_lines += 1;
-                }
-            }
-            next_text.push_str(&next_line);
-            next_text.push_str(line_ending);
-        }
-
-        if is_subagent && authoritative_identity {
-            if let Some(id) = thread_id.as_ref() {
-                if expected_thread_ids.is_none_or(|expected| expected.contains(id)) {
-                    scan.internal_thread_ids.insert(id.clone());
-                }
-            }
-        }
-        if (exclude_source_marked_subagents && is_subagent)
-            || thread_id
-                .as_ref()
-                .is_some_and(|id| excluded_thread_ids.is_some_and(|excluded| excluded.contains(id)))
+        if excluded_thread_ids.is_some_and(|excluded| excluded.contains(identity_id))
+            || allowed_thread_ids.is_some_and(|allowed| !allowed.contains(identity_id))
         {
             continue;
         }
-        if invalid_json_lines > 0 {
-            scan.scan_failures.push(format!(
-                "会话文件包含 {invalid_json_lines} 行无法解析的 JSON: {}",
-                path.display()
-            ));
-        }
-        if invalid_session_meta > 0 {
-            scan.scan_failures.push(format!(
-                "会话文件包含 {invalid_session_meta} 条无法读取的 session_meta: {}",
-                path.display()
-            ));
-        }
-        if invalid_json_lines > 0 || invalid_session_meta > 0 {
-            // A broken orphan remains a warning, but must never become a
-            // provider/catalog candidate merely because one metadata line parsed.
-            continue;
-        }
-
-        if file_session_meta_count == 0 {
-            if expected_thread_ids.is_some() {
+        let streamed = match scan_rollout_stream(&mut rollout_file, &path, target_provider) {
+            Ok(streamed) => streamed,
+            Err(error) => {
                 scan.scan_failures.push(format!(
-                    "活动 SQLite 引用的会话文件缺少 session_meta: {}",
-                    path.display()
-                ));
-            }
-            continue;
-        }
-        let Some(thread_id) = thread_id else {
-            scan.scan_failures.push(format!(
-                "会话文件的 session_meta 缺少 id: {}",
-                path.display()
-            ));
-            continue;
-        };
-        if let Some(expected_thread_ids) = expected_thread_ids {
-            if expected_thread_ids.len() != 1 || !expected_thread_ids.contains(&thread_id) {
-                scan.scan_failures.push(format!(
-                    "活动 SQLite 引用的会话文件与线程 ID 不一致: {}",
+                    "会话文件未完成检查或改写: {} ({error})",
                     path.display()
                 ));
                 continue;
             }
-        }
-        if allowed_thread_ids.is_some_and(|allowed| !allowed.contains(&thread_id)) {
+        };
+        let thread_id = streamed.first_meta.id.trim().to_string();
+        // The same open handle is used for identity and complete scanning.
+        // Still reject a changed first record instead of pairing mismatched snapshots.
+        if thread_id != identity_id
+            || streamed.first_meta.is_internal != identity.payload.is_internal()
+        {
+            scan.scan_failures.push(format!(
+                "会话来源信息在扫描期间发生变化: {}",
+                path.display()
+            ));
             continue;
         }
-        scan.session_meta_count += file_session_meta_count;
+        scan.session_meta_count += streamed.session_meta_count;
         scan.provider_candidate_paths.insert(path.clone());
+        scan.verified_rollout_hashes
+            .insert(path.clone(), streamed.original_hash);
         scan.thread_ids.insert(thread_id.clone());
-        if let Some(cwd) = cwd {
+        if let Some(cwd) = streamed
+            .first_meta
+            .cwd
+            .as_deref()
+            .and_then(normalize_workspace_path)
+        {
             scan.cwd_by_thread_id.insert(thread_id.clone(), cwd);
         }
-        if rewrite_needed {
+        if let Some(snapshot) = streamed.staged {
             scan.mismatched_rollouts += 1;
-            scan.mismatched_session_meta += file_mismatched_session_meta;
+            scan.mismatched_session_meta += streamed.mismatch_count;
             scan.mismatched_thread_ids.insert(thread_id);
             scan.changes.push(SessionFileChange {
-                original_mtime: fs::metadata(&path)
-                    .and_then(|metadata| metadata.modified())
-                    .ok(),
                 path,
-                original_text: text,
-                next_text,
+                original_text: String::new(),
+                next_text: String::new(),
+                original_mtime: streamed.original_mtime,
+                streamed: Some(snapshot),
             });
         }
     }
@@ -509,48 +425,135 @@ fn rollout_file_is_open(_path: &Path) -> bool {
     false
 }
 
+fn ensure_rollout_snapshot_unchanged(path: &Path, expected: &[u8; 32]) -> Result<()> {
+    if hash_rollout_file(path).map_err(|error| io_err(path, error))? == *expected {
+        Ok(())
+    } else {
+        Err(CodexxError::Config(format!(
+            "会话文件已变化，已取消写入: {}",
+            path.display()
+        )))
+    }
+}
+
+fn atomic_write_rollout<R: Read>(
+    path: &Path,
+    mut reader: R,
+    expected_current: &[u8; 32],
+    expected_output: &[u8; 32],
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| CodexxError::Config("会话文件缺少父目录".into()))?;
+    let permissions = fs::metadata(path)
+        .map_err(|error| io_err(path, error))?
+        .permissions();
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".codex-x-rollout-")
+        .tempfile_in(parent)
+        .map_err(|error| io_err(path, error))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| io_err(path, error))?;
+        if count == 0 {
+            break;
+        }
+        temporary
+            .write_all(&buffer[..count])
+            .map_err(|error| io_err(path, error))?;
+        hasher.update(&buffer[..count]);
+    }
+    let output_hash: [u8; 32] = hasher.finalize().into();
+    if output_hash != *expected_output {
+        return Err(CodexxError::Config(format!(
+            "会话改写临时快照已变化，已取消写入: {}",
+            path.display()
+        )));
+    }
+    temporary
+        .as_file()
+        .set_permissions(permissions)
+        .map_err(|error| io_err(path, error))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| io_err(path, error))?;
+    ensure_rollout_snapshot_unchanged(path, expected_current)?;
+    temporary
+        .persist(path)
+        .map_err(|error| io_err(path, error.error))?;
+    Ok(())
+}
+
+fn write_session_change(change: &SessionFileChange, restore: bool) -> Result<()> {
+    let (current, output) = if restore {
+        (change.next_hash(), change.original_hash())
+    } else {
+        (change.original_hash(), change.next_hash())
+    };
+    if let Some(snapshot) = &change.streamed {
+        let source = if restore {
+            &snapshot.original_path
+        } else {
+            &snapshot.next_path
+        };
+        let reader = fs::File::open(source).map_err(|error| io_err(source, error))?;
+        atomic_write_rollout(&change.path, reader, &current, &output)
+    } else {
+        let text = if restore {
+            &change.original_text
+        } else {
+            &change.next_text
+        };
+        atomic_write_rollout(&change.path, text.as_bytes(), &current, &output)
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn apply_session_changes(
     changes: &[SessionFileChange],
 ) -> Result<(Vec<SessionFileChange>, Vec<PathBuf>)> {
+    apply_session_changes_with_hook(changes, |_| Ok(()))
+}
+
+pub(super) fn apply_session_changes_with_hook<F>(
+    changes: &[SessionFileChange],
+    mut hook: F,
+) -> Result<(Vec<SessionFileChange>, Vec<PathBuf>)>
+where
+    F: FnMut(usize) -> Result<()>,
+{
     let mut applied = Vec::new();
     let mut skipped = Vec::new();
-    for change in changes {
-        if rollout_file_is_open(&change.path) {
-            skipped.push(change.path.clone());
-            continue;
-        }
-        match fs::read_to_string(&change.path) {
-            Ok(current) if current == change.original_text => {}
-            Ok(_) => {
-                skipped.push(change.path.clone());
-                continue;
+    for (index, change) in changes.iter().enumerate() {
+        let attempt = (|| {
+            hook(index)?;
+            if rollout_file_is_open(&change.path) {
+                return Ok(false);
             }
-            Err(error) if is_locked_io_error(&error) => {
-                skipped.push(change.path.clone());
-                continue;
+            match hash_rollout_file(&change.path) {
+                Ok(current) if current == change.original_hash() => {}
+                Ok(_) => return Ok(false),
+                Err(error) if is_locked_io_error(&error) => return Ok(false),
+                Err(error) => return Err(io_err(&change.path, error)),
             }
-            Err(error) => {
-                let original_error = io_err(&change.path, error);
-                return match restore_session_changes(&applied) {
-                    Ok(()) => Err(original_error),
-                    Err(rollback_error) => Err(CodexxError::Config(format!(
-                        "{original_error}；回滚失败：{rollback_error}"
-                    ))),
-                };
-            }
-        }
-        match atomic_write(&change.path, change.next_text.as_bytes()) {
-            Ok(()) => {
-                restore_file_mtime(&change.path, change.original_mtime);
-                applied.push(change.clone());
-            }
+            write_session_change(change, false)?;
+            restore_file_mtime(&change.path, change.original_mtime);
+            Ok(true)
+        })();
+        match attempt {
+            Ok(true) => applied.push(change.clone()),
+            Ok(false) => skipped.push(change.path.clone()),
             Err(error) => {
                 return match restore_session_changes(&applied) {
                     Ok(()) => Err(error),
                     Err(rollback_error) => Err(CodexxError::Config(format!(
                         "{error}；回滚失败：{rollback_error}"
                     ))),
-                };
+                }
             }
         }
     }
@@ -559,18 +562,11 @@ pub(crate) fn apply_session_changes(
 
 pub(crate) fn restore_session_changes(changes: &[SessionFileChange]) -> Result<()> {
     let mut failed = 0usize;
-    for change in changes {
-        if rollout_file_is_open(&change.path) {
-            failed += 1;
-            continue;
-        }
-        let unchanged =
-            fs::read_to_string(&change.path).is_ok_and(|current| current == change.next_text);
-        if !unchanged {
-            failed += 1;
-            continue;
-        }
-        if atomic_write(&change.path, change.original_text.as_bytes()).is_err() {
+    for change in changes.iter().rev() {
+        if rollout_file_is_open(&change.path)
+            || !hash_rollout_file(&change.path).is_ok_and(|hash| hash == change.next_hash())
+            || write_session_change(change, true).is_err()
+        {
             failed += 1;
             continue;
         }
@@ -1199,74 +1195,11 @@ pub(crate) fn source_text_is_subagent(source: &str) -> bool {
 #[derive(Default)]
 struct InternalSource(bool);
 
-impl<'de> Deserialize<'de> for InternalSource {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        struct SourceVisitor;
-        impl<'de> Visitor<'de> for SourceVisitor {
-            type Value = InternalSource;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("session source")
-            }
-
-            fn visit_str<E: serde::de::Error>(
-                self,
-                value: &str,
-            ) -> std::result::Result<Self::Value, E> {
-                Ok(InternalSource(source_kind_is_internal(value)))
-            }
-
-            fn visit_map<M: MapAccess<'de>>(
-                self,
-                mut map: M,
-            ) -> std::result::Result<Self::Value, M::Error> {
-                let mut internal = false;
-                while let Some(key) = map.next_key::<String>()? {
-                    internal |= key == "subagent" || key == "internal";
-                    map.next_value::<IgnoredAny>()?;
-                }
-                Ok(InternalSource(internal))
-            }
-
-            fn visit_seq<A: SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> std::result::Result<Self::Value, A::Error> {
-                while seq.next_element::<IgnoredAny>()?.is_some() {}
-                Ok(InternalSource(false))
-            }
-
-            fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
-                Ok(InternalSource(false))
-            }
-
-            fn visit_bool<E: serde::de::Error>(
-                self,
-                _: bool,
-            ) -> std::result::Result<Self::Value, E> {
-                Ok(InternalSource(false))
-            }
-
-            fn visit_i64<E: serde::de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
-                Ok(InternalSource(false))
-            }
-
-            fn visit_u64<E: serde::de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
-                Ok(InternalSource(false))
-            }
-
-            fn visit_f64<E: serde::de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
-                Ok(InternalSource(false))
-            }
-        }
-        deserializer.deserialize_any(SourceVisitor)
-    }
-}
-
-#[derive(Default, Deserialize)]
+#[derive(Default)]
 struct RolloutIdentityPayload {
     id: Option<String>,
-    #[serde(default)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    model_provider: Option<String>,
     source: InternalSource,
     thread_source: Option<String>,
 }
@@ -1281,23 +1214,21 @@ impl RolloutIdentityPayload {
     }
 }
 
-#[derive(Deserialize)]
 struct RolloutIdentityRecord {
-    #[serde(rename = "type")]
     kind: String,
-    #[serde(default)]
     payload: RolloutIdentityPayload,
 }
 
 /// Classify only the rollout's own first metadata record. A user-created fork
 /// can replay an internal parent's metadata later without becoming internal.
 pub(super) fn rollout_text_is_internal(text: &str) -> bool {
-    RolloutIdentityRecord::deserialize(&mut serde_json::Deserializer::from_str(text))
-        .is_ok_and(|record| record.kind == "session_meta" && record.payload.is_internal())
+    read_first_meta(text.as_bytes(), Path::new("inline rollout snapshot"))
+        .is_ok_and(|record| record.is_internal)
 }
 
 pub(super) fn rollout_path_has_syncable_identity(path: &Path) -> Result<bool> {
-    read_rollout_identity(path)
+    let file = fs::File::open(path).map_err(|error| io_err(path, error))?;
+    read_rollout_identity_from_reader(file, path)
         .map(|record| !record.payload.is_internal())
         .map_err(CodexxError::Config)
 }
@@ -1338,18 +1269,25 @@ fn rollout_filename_thread_id(path: &Path) -> Option<&str> {
     (is_filename_uuid(thread_id) && delimiter == "-").then_some(thread_id)
 }
 
-fn read_rollout_identity(path: &Path) -> std::result::Result<RolloutIdentityRecord, String> {
-    let file = fs::File::open(path)
-        .map_err(|_| format!("无法读取会话文件来源信息: {}", path.display()))?;
-    let record = RolloutIdentityRecord::deserialize(&mut serde_json::Deserializer::from_reader(
-        BufReader::new(file),
-    ))
-    .map_err(|_| {
+fn read_rollout_identity_from_reader<R: Read>(
+    reader: R,
+    path: &Path,
+) -> std::result::Result<RolloutIdentityRecord, String> {
+    let first = read_first_meta(reader, path).map_err(|error| {
         format!(
-            "会话文件包含无法解析的 JSON 或无法读取会话文件来源信息: {}",
+            "会话文件包含无法解析的 JSON 或无法读取会话文件来源信息: {} ({error})",
             path.display()
         )
     })?;
+    let record = RolloutIdentityRecord {
+        kind: "session_meta".into(),
+        payload: RolloutIdentityPayload {
+            id: Some(first.id),
+            model_provider: first.provider,
+            source: InternalSource(first.is_internal),
+            thread_source: None,
+        },
+    };
     if record.kind != "session_meta" {
         return Err(format!("会话文件缺少起始 session_meta: {}", path.display()));
     }
@@ -1369,6 +1307,12 @@ fn read_rollout_identity(path: &Path) -> std::result::Result<RolloutIdentityReco
         ));
     }
     Ok(record)
+}
+
+fn read_rollout_identity(path: &Path) -> std::result::Result<RolloutIdentityRecord, String> {
+    let file = fs::File::open(path)
+        .map_err(|_| format!("无法读取会话文件来源信息: {}", path.display()))?;
+    read_rollout_identity_from_reader(file, path)
 }
 
 fn is_authoritative_rollout(
@@ -2074,6 +2018,252 @@ mod tests {
         assert!(scan.thread_ids.contains("fork"));
         assert!(!scan.thread_ids.contains("internal"));
         assert_eq!(scan.changes.len(), 1);
+        let original_hash: [u8; 32] = Sha256::digest(fork_text.as_bytes()).into();
+        assert_eq!(
+            scan.verified_rollout_hashes.get(&scan.changes[0].path),
+            Some(&original_hash)
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    const LEGACY_READ_LIMIT: u64 = 32 * 1024 * 1024;
+
+    #[test]
+    fn streaming_hash_uses_fixed_read_buffers_and_propagates_io_errors() {
+        struct CountedReader {
+            remaining: usize,
+            largest: usize,
+        }
+        impl Read for CountedReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.largest = self.largest.max(buffer.len());
+                let count = buffer.len().min(self.remaining);
+                buffer[..count].fill(b'x');
+                self.remaining -= count;
+                Ok(count)
+            }
+        }
+        let mut reader = CountedReader {
+            remaining: 97 * 1024 * 1024,
+            largest: 0,
+        };
+        hash_reader(&mut reader).unwrap();
+        assert_eq!(reader.remaining, 0);
+        assert_eq!(reader.largest, 64 * 1024);
+        struct FailingReader;
+        impl Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("synthetic read failure"))
+            }
+        }
+        assert!(hash_reader(FailingReader).is_err());
+    }
+
+    fn padded_rollout(path: &Path, id: &str, provider: &str, size: u64) {
+        let header = serde_json::json!({"type":"session_meta","payload":{"id":id,"model_provider":provider,"source":"vscode"}}).to_string() + "\n";
+        let mut file = fs::File::create(path).unwrap();
+        file.write_all(header.as_bytes()).unwrap();
+        let padding = [b' '; 64 * 1024];
+        let mut remaining = size - header.len() as u64;
+        while remaining > 0 {
+            let count = remaining.min(padding.len() as u64) as usize;
+            file.write_all(&padding[..count]).unwrap();
+            remaining -= count as u64;
+        }
+    }
+
+    #[test]
+    fn streaming_scan_accepts_below_exact_and_above_previous_limit() {
+        let dir = temp_codex_dir("streaming-rollout-boundaries");
+        let sessions = dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        for (name, size) in [
+            ("below", LEGACY_READ_LIMIT - 1),
+            ("exact", LEGACY_READ_LIMIT),
+            ("above", LEGACY_READ_LIMIT + 1),
+        ] {
+            padded_rollout(
+                &sessions.join(format!("rollout-{name}.jsonl")),
+                name,
+                "custom",
+                size,
+            );
+        }
+        let scan =
+            scan_provider_rollouts(&dir, "custom", &HashSet::new(), &HashMap::new()).unwrap();
+        assert!(scan.scan_failures.is_empty(), "{:?}", scan.scan_failures);
+        assert!(scan.blocked_failures.is_empty());
+        assert_eq!(scan.thread_ids.len(), 3);
+        assert_eq!(scan.verified_rollout_hashes.len(), 3);
+        assert_eq!(scan.session_meta_count, 3);
+        assert!(scan.changes.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_large_user_files_fail_while_internal_and_excluded_files_are_ignored() {
+        let dir = temp_codex_dir("streaming-invalid-rollouts");
+        let sessions = dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        for (name, source) in [
+            ("user", "vscode"),
+            ("internal", "internal"),
+            ("excluded", "vscode"),
+        ] {
+            let path = sessions.join(format!("rollout-{name}.jsonl"));
+            let header = serde_json::json!({"type":"session_meta","payload":{"id":name,"model_provider":"openai","source":source}});
+            fs::write(&path, format!("{header}\n")).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(LEGACY_READ_LIMIT + 1)
+                .unwrap();
+        }
+        let scan = scan_provider_rollouts(
+            &dir,
+            "custom",
+            &HashSet::from(["excluded".into()]),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(scan.scan_failures.len(), 1);
+        assert!(scan.blocked_failures.is_empty());
+        assert!(scan.changes.is_empty());
+        assert!(scan.verified_rollout_hashes.is_empty());
+        assert_eq!(scan.internal_thread_ids, HashSet::from(["internal".into()]));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn provider_expansion_above_previous_limit_is_staged_and_reversible() {
+        let dir = temp_codex_dir("streaming-output-expansion");
+        fs::create_dir_all(dir.join("sessions")).unwrap();
+        let path = dir.join("sessions/rollout-expanded.jsonl");
+        padded_rollout(&path, "expanded", "tiny", LEGACY_READ_LIMIT);
+        let original_hash = hash_rollout_file(&path).unwrap();
+        let original_mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        let scan = scan_provider_rollouts(
+            &dir,
+            "provider-longer-than-tiny",
+            &HashSet::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert!(scan.scan_failures.is_empty(), "{:?}", scan.scan_failures);
+        assert_eq!(scan.changes.len(), 1);
+        let change = &scan.changes[0];
+        assert!(change.original_text.is_empty());
+        assert!(change.next_text.is_empty());
+        let staged = change.streamed.as_ref().unwrap();
+        assert!(fs::metadata(&staged.next_path).unwrap().len() > LEGACY_READ_LIMIT);
+        assert_eq!(hash_rollout_file(&path).unwrap(), original_hash);
+        let (applied, skipped) = apply_session_changes(&scan.changes).unwrap();
+        assert_eq!(applied.len(), 1);
+        assert!(skipped.is_empty());
+        assert_eq!(
+            read_rollout_identity(&path)
+                .unwrap()
+                .payload
+                .model_provider
+                .as_deref(),
+            Some("provider-longer-than-tiny")
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            original_mtime
+        );
+        restore_session_changes(&applied).unwrap();
+        assert_eq!(hash_rollout_file(&path).unwrap(), original_hash);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn disk_snapshots_do_not_accumulate_conversation_text_in_memory() {
+        let dir = temp_codex_dir("streaming-snapshot-budget");
+        fs::create_dir_all(dir.join("sessions")).unwrap();
+        for index in 0..4 {
+            let id = format!("budget-{index}");
+            padded_rollout(
+                &dir.join(format!("sessions/rollout-{id}.jsonl")),
+                &id,
+                "openai",
+                22 * 1024 * 1024,
+            );
+        }
+        let scan =
+            scan_provider_rollouts(&dir, "custom", &HashSet::new(), &HashMap::new()).unwrap();
+        assert!(scan.scan_failures.is_empty(), "{:?}", scan.scan_failures);
+        assert!(scan.blocked_failures.is_empty());
+        assert_eq!(scan.changes.len(), 4);
+        assert_eq!(scan.provider_candidate_paths.len(), 4);
+        assert_eq!(
+            scan.changes
+                .iter()
+                .map(|c| c.original_text.capacity() + c.next_text.capacity())
+                .sum::<usize>(),
+            0
+        );
+        assert!(scan.changes.iter().all(|c| c.streamed.is_some()));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn apply_and_restore_preserve_externally_grown_rollouts() {
+        let dir = temp_codex_dir("streaming-apply-restore");
+        let path = dir.join("rollout-grown.jsonl");
+        fs::write(&path, "external fixture").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(LEGACY_READ_LIMIT + 1)
+            .unwrap();
+        let change = SessionFileChange {
+            path: path.clone(),
+            original_text: "external fixture".into(),
+            next_text: "rewritten fixture".into(),
+            original_mtime: None,
+            streamed: None,
+        };
+        let (applied, skipped) = apply_session_changes(std::slice::from_ref(&change)).unwrap();
+        assert!(applied.is_empty());
+        assert_eq!(skipped, vec![path.clone()]);
+        assert!(restore_session_changes(std::slice::from_ref(&change)).is_err());
+        assert_eq!(fs::metadata(&path).unwrap().len(), LEGACY_READ_LIMIT + 1);
+        assert!(ensure_rollout_snapshot_unchanged(&path, &change.original_hash()).is_err());
+        assert!(rollout_path_has_syncable_identity(&path).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn corrupted_disk_snapshot_cannot_replace_log_and_prior_changes_roll_back() {
+        let dir = temp_codex_dir("streaming-staged-write-failure");
+        fs::create_dir_all(dir.join("sessions")).unwrap();
+        for id in ["a", "b"] {
+            padded_rollout(
+                &dir.join(format!("sessions/rollout-{id}.jsonl")),
+                id,
+                "openai",
+                1024,
+            );
+        }
+        let scan =
+            scan_provider_rollouts(&dir, "custom", &HashSet::new(), &HashMap::new()).unwrap();
+        let original_hashes: Vec<_> = scan
+            .changes
+            .iter()
+            .map(|c| (c.path.clone(), c.original_hash()))
+            .collect();
+        fs::write(
+            &scan.changes[1].streamed.as_ref().unwrap().next_path,
+            b"corrupted snapshot",
+        )
+        .unwrap();
+        assert!(apply_session_changes(&scan.changes).is_err());
+        for (path, hash) in original_hashes {
+            assert_eq!(hash_rollout_file(&path).unwrap(), hash);
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 

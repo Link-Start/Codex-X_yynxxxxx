@@ -3,8 +3,8 @@ use super::catalog::{
     restore_catalog_updates, CatalogRepairThread,
 };
 use super::storage::{
-    apply_session_changes, restore_session_changes, rollout_path_has_syncable_identity,
-    rollout_text_is_internal, sqlite_subagent_thread_ids,
+    apply_session_changes_with_hook, hash_rollout_file, restore_session_changes,
+    rollout_path_has_syncable_identity, rollout_text_is_internal, sqlite_subagent_thread_ids,
 };
 use super::types::{RolloutScan, SessionFileChange};
 use crate::error::{CodexxError, Result};
@@ -37,6 +37,7 @@ impl SqliteUpdateCounts {
 #[derive(Debug, Default)]
 pub(super) struct MutationJournal {
     applied_rollouts: Vec<SessionFileChange>,
+    expected_rollout_hashes: HashMap<PathBuf, [u8; 32]>,
     sqlite_restore_attempts: Vec<SqliteRestoreAttempt>,
 }
 
@@ -285,6 +286,7 @@ where
 {
     let mut updated = SqliteUpdateCounts::default();
     for index in 0..pending.len() {
+        validate_rollout_snapshots(&journal.expected_rollout_hashes)?;
         let before_commit = sqlite_data_version(&pending[index].observer)?;
         journal.sqlite_restore_attempts.push(SqliteRestoreAttempt {
             path: pending[index].path.clone(),
@@ -311,6 +313,9 @@ where
             return Err(error);
         }
     }
+    // The final commit hook can publish an external rollout update as well.
+    // Returning success requires the complete candidate set to remain verified.
+    validate_rollout_snapshots(&journal.expected_rollout_hashes)?;
     Ok(updated)
 }
 
@@ -418,13 +423,13 @@ pub(super) fn mutation_error(original: CodexxError, recovery_errors: Vec<String>
 pub(super) enum MutationPoint {
     BeforeSqliteLock,
     BeforeRolloutMutation,
+    BeforeEachRolloutMutation(usize),
     AfterRolloutMutation,
     AfterSqliteCommit(usize),
 }
 
 pub(super) struct MutationResult {
     pub(super) applied_rollouts: usize,
-    pub(super) skipped_rollouts: Vec<PathBuf>,
     pub(super) sqlite_updates: SqliteUpdateCounts,
 }
 
@@ -434,7 +439,12 @@ pub(super) struct MutationResult {
 fn validate_rollout_classification(rollouts: &RolloutScan) -> Result<()> {
     let mut paths = rollouts.provider_candidate_paths.clone();
     for change in &rollouts.changes {
-        if rollout_text_is_internal(&change.original_text) {
+        let original_is_internal = if let Some(snapshot) = &change.streamed {
+            !rollout_path_has_syncable_identity(&snapshot.original_path)?
+        } else {
+            rollout_text_is_internal(&change.original_text)
+        };
+        if original_is_internal {
             return Err(CodexxError::Config(
                 "内部会话不能同步为普通会话。".to_string(),
             ));
@@ -445,6 +455,46 @@ fn validate_rollout_classification(rollouts: &RolloutScan) -> Result<()> {
         if !rollout_path_has_syncable_identity(&path)? {
             return Err(CodexxError::Config(format!(
                 "会话类型已变化，已停止同步；请重新检查会话：{}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn expected_rollout_hashes(rollouts: &RolloutScan) -> Result<HashMap<PathBuf, [u8; 32]>> {
+    let mut expected = HashMap::new();
+    for path in &rollouts.provider_candidate_paths {
+        let hash = rollouts.verified_rollout_hashes.get(path).ok_or_else(|| {
+            CodexxError::Config(format!(
+                "缺少会话文件验证快照，已停止同步：{}",
+                path.display()
+            ))
+        })?;
+        expected.insert(path.clone(), *hash);
+    }
+    for change in &rollouts.changes {
+        let original_hash = change.original_hash();
+        if expected
+            .get(&change.path)
+            .is_some_and(|hash| *hash != original_hash)
+        {
+            return Err(CodexxError::Config(format!(
+                "会话文件改写快照与扫描结果不一致，已停止同步：{}",
+                change.path.display()
+            )));
+        }
+        // A planned change already carries the scan's verified original snapshot.
+        expected.insert(change.path.clone(), original_hash);
+    }
+    Ok(expected)
+}
+
+fn validate_rollout_snapshots(expected: &HashMap<PathBuf, [u8; 32]>) -> Result<()> {
+    for (path, expected_hash) in expected {
+        if hash_rollout_file(path).map_err(|error| io_err(path, error))? != *expected_hash {
+            return Err(CodexxError::Config(format!(
+                "会话文件已发生变化，已停止同步；请重新检查会话：{}",
                 path.display()
             )));
         }
@@ -465,12 +515,35 @@ where
     F: FnMut(MutationPoint) -> Result<()>,
 {
     let result = (|| -> Result<MutationResult> {
+        if !rollouts.blocked_failures.is_empty() {
+            return Err(CodexxError::Config(format!(
+                "会话扫描未完成，已停止同步：{}",
+                rollouts.blocked_failures.join("；")
+            )));
+        }
+        journal.expected_rollout_hashes = expected_rollout_hashes(rollouts)?;
         hook(MutationPoint::BeforeRolloutMutation)?;
         validate_rollout_classification(rollouts)?;
-        let (applied_rollouts, skipped_rollouts) = apply_session_changes(&rollouts.changes)?;
+        validate_rollout_snapshots(&journal.expected_rollout_hashes)?;
+        let (applied_rollouts, skipped_rollouts) =
+            apply_session_changes_with_hook(&rollouts.changes, |index| {
+                hook(MutationPoint::BeforeEachRolloutMutation(index))
+            })?;
         journal.applied_rollouts = applied_rollouts;
+        for change in &journal.applied_rollouts {
+            journal
+                .expected_rollout_hashes
+                .insert(change.path.clone(), change.next_hash());
+        }
+        if !skipped_rollouts.is_empty() {
+            return Err(CodexxError::Config(format!(
+                "有 {} 个会话文件被占用或已发生变化，已停止同步；请退出 Codex 后重新检查会话。",
+                skipped_rollouts.len()
+            )));
+        }
         hook(MutationPoint::AfterRolloutMutation)?;
         validate_rollout_classification(rollouts)?;
+        validate_rollout_snapshots(&journal.expected_rollout_hashes)?;
         apply_sqlite_updates(
             pending_sqlite,
             rollouts,
@@ -481,7 +554,6 @@ where
         let sqlite_updates = commit_sqlite_updates(pending_sqlite, journal, hook)?;
         Ok(MutationResult {
             applied_rollouts: journal.applied_rollouts.len(),
-            skipped_rollouts,
             sqlite_updates,
         })
     })();

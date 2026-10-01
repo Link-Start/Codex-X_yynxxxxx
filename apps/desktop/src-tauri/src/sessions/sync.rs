@@ -127,10 +127,15 @@ fn scan_provider_sync_data(
     sqlite.mismatched_thread_ids = mismatched_thread_ids;
     sqlite.mismatched_threads = sqlite.mismatched_thread_ids.len();
 
-    let indexed_rollouts = if active_sqlite.sqlite_dbs > 0 {
-        scan_provider_buckets(codex_dir, target_provider, &active_sqlite)?
-    } else {
-        scan_provider_buckets(codex_dir, target_provider, &sqlite)?
+    // Only diagnostics from this authority scan are needed below. Drop its
+    // planned file copies before scanning the complete provider history.
+    let (indexed_rollout_failures, indexed_blocked_failures) = {
+        let rollouts = if active_sqlite.sqlite_dbs > 0 {
+            scan_provider_buckets(codex_dir, target_provider, &active_sqlite)?
+        } else {
+            scan_provider_buckets(codex_dir, target_provider, &sqlite)?
+        };
+        (rollouts.scan_failures, rollouts.blocked_failures)
     };
     let legacy_index_warnings = scan_legacy_index_warnings(codex_dir, target_provider, discovery);
     let mut rollouts = scan_provider_rollouts(
@@ -169,29 +174,24 @@ fn scan_provider_sync_data(
     let mut scan_failures = discovery.active_scan_failures.clone();
     scan_failures.extend(active_sqlite.scan_failures.iter().cloned());
     scan_failures.extend(sqlite.scan_failures.iter().cloned());
-    scan_failures.extend(indexed_rollouts.scan_failures.iter().cloned());
+    scan_failures.extend(indexed_rollout_failures.iter().cloned());
+    scan_failures.extend(indexed_blocked_failures);
+    // A size/buffer limit means the rollout was not completely inspected.
+    // This is blocking even for an orphan, rather than a success with a warning.
+    scan_failures.extend(rollouts.blocked_failures.iter().cloned());
+    // A failed eligible rollout read/parse is an incomplete check, including
+    // unindexed files. It must not become an apparently successful sync.
+    scan_failures.extend(rollouts.scan_failures.iter().cloned());
     for path in &discovery.unreadable_paths {
         scan_failures.push(format!("无法读取会话数据库: {}", path.display()));
     }
 
-    let indexed_failures = indexed_rollouts
-        .scan_failures
-        .iter()
-        .cloned()
-        .collect::<HashSet<_>>();
     let mut warnings = rollouts.warnings.clone();
     // The full provider/index scans below own warnings and blocking failures;
     // repeating the lightweight identity scan's messages would duplicate them.
     warnings.extend(active_sqlite.warnings.iter().cloned());
     warnings.extend(sqlite.warnings.iter().cloned());
     warnings.extend(legacy_index_warnings);
-    warnings.extend(
-        rollouts
-            .scan_failures
-            .iter()
-            .filter(|failure| !indexed_failures.contains(*failure))
-            .map(|failure| format!("已跳过未进入会话索引的异常文件：{failure}")),
-    );
     let mut seen = HashSet::new();
     scan_failures.retain(|failure| seen.insert(failure.clone()));
     seen.clear();
@@ -284,6 +284,7 @@ pub(super) fn session_sync_status_with_discovery(
             && mismatched_ids.contains(&session.id);
     }
     let needs_sync = !scan.rollouts.changes.is_empty()
+        || !scan.rollouts.mismatched_thread_ids.is_empty()
         || scan.sqlite.mismatched_threads > 0
         || scan.catalog.total_updates() > 0;
     Ok(SessionSyncStatus {
@@ -391,6 +392,7 @@ where
             backup_dir: String::new(),
         });
     }
+    drop(preflight_scan);
 
     hook(MutationPoint::BeforeSqliteLock)?;
     let mut pending_sqlite = prepare_sqlite_updates(&discovery.related_paths)?;
@@ -411,6 +413,14 @@ where
     {
         rollback_open_transactions(&mut pending_sqlite);
         let status = session_sync_status_with_discovery(&codex_dir, target_provider, &discovery)?;
+        if !status.scan_complete {
+            return Err(scan_failure_error(&status.scan_failures));
+        }
+        if status.needs_sync {
+            return Err(CodexxError::Config(
+                "会话状态在检查后发生变化，未完成同步；请重新检查。".to_string(),
+            ));
+        }
         return Ok(SessionSyncResult {
             status,
             updated_rollouts: 0,
@@ -458,24 +468,31 @@ where
         }
     };
 
-    let prune_warning = prune_provider_sync_backups(&codex_dir).err();
     let mut status = session_sync_status_with_discovery(&codex_dir, target_provider, &discovery)
+        .and_then(|status| {
+            if !status.scan_complete {
+                return Err(scan_failure_error(&status.scan_failures));
+            }
+            if status.needs_sync {
+                return Err(CodexxError::Config(
+                    "会话日志与索引仍不一致，未完成同步；请重新检查。".to_string(),
+                ));
+            }
+            Ok(status)
+        })
         .map_err(|error| {
-            CodexxError::Config(format!(
-                "同步已完成，但刷新会话列表失败，请重新进入页面：{error}"
-            ))
+            let recovery_errors = rollback_mutation(&journal, &mut pending_sqlite);
+            mutation_error(
+                CodexxError::Config(format!("同步后复查未通过，本轮同步未完成：{error}")),
+                recovery_errors,
+            )
         })?;
+    let prune_warning = prune_provider_sync_backups(&codex_dir).err();
     status.backup_dir = Some(backup.dir.display().to_string());
     if prune_warning.is_some() {
         status
             .warnings
             .push("同步已完成，但旧备份暂未清理。".to_string());
-    }
-    if !mutation.skipped_rollouts.is_empty() {
-        status.warnings.push(format!(
-            "有 {} 个会话正在使用，已跳过；退出 Codex 后再同步即可。",
-            mutation.skipped_rollouts.len()
-        ));
     }
     Ok(SessionSyncResult {
         status,
@@ -489,9 +506,12 @@ where
 mod tests {
     use super::*;
     use rusqlite::Connection;
+    use sha2::{Digest, Sha256};
+    use std::io::{BufRead, Read, Seek, SeekFrom};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     const SHARED_SESSION_PROVIDER: &str = "custom";
+    const LEGACY_LIMIT: u64 = 32 * 1024 * 1024;
 
     fn temp_codex_dir(label: &str) -> std::path::PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -674,6 +694,383 @@ mod tests {
             ),
         )
         .expect("write rollout");
+    }
+
+    fn pad_rollout_to_size(path: &Path, size: u64) {
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        let mut remaining = size.checked_sub(file.metadata().unwrap().len()).unwrap();
+        let padding = [b' '; 64 * 1024];
+        while remaining > 0 {
+            let count = remaining.min(padding.len() as u64) as usize;
+            file.write_all(&padding[..count]).unwrap();
+            remaining -= count as u64;
+        }
+    }
+
+    fn rollout_digest(path: &Path) -> Vec<u8> {
+        rollout_digest_from_offset(path, 0)
+    }
+
+    fn rollout_digest_from_offset(path: &Path, offset: u64) -> Vec<u8> {
+        let mut file = fs::File::open(path).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        let mut digest = Sha256::new();
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer).unwrap();
+            if count == 0 {
+                return digest.finalize().to_vec();
+            }
+            digest.update(&buffer[..count]);
+        }
+    }
+
+    fn append_chat_record(path: &Path) {
+        fs::OpenOptions::new().append(true).open(path).unwrap()
+            .write_all(b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"keep this conversation\"}}\n")
+            .unwrap();
+    }
+
+    fn read_first_rollout_record(path: &Path) -> String {
+        let mut first_record = String::new();
+        std::io::BufReader::new(fs::File::open(path).unwrap())
+            .read_line(&mut first_record)
+            .unwrap();
+        first_record
+    }
+
+    #[test]
+    fn streamed_rollouts_below_at_and_above_legacy_limit_sync_logs_databases_and_catalogs() {
+        for (name, size) in [
+            ("normal", 512),
+            ("below-old-limit", LEGACY_LIMIT - 1),
+            ("exact-old-limit", LEGACY_LIMIT),
+            ("above-old-limit", LEGACY_LIMIT + 1),
+        ] {
+            let dir = temp_codex_dir(name);
+            write_config(&dir, "custom");
+            let id = "019f6000-0000-7000-8000-000000000701";
+            let rollout = write_rollout(&dir, id, "openai");
+            let old_record_len = read_first_rollout_record(&rollout).len() as u64;
+            append_chat_record(&rollout);
+            pad_rollout_to_size(&rollout, size);
+            let conversation_before = rollout_digest_from_offset(&rollout, old_record_len);
+            let database = dir.join("state_5.sqlite");
+            create_thread_database_with_rollout(&database, id, "openai", &rollout);
+            let catalog = dir.join("sqlite/codex-dev.db");
+            create_catalog_database(&catalog, &[(id, "openai")]);
+
+            let status = session_sync_status_inner(Some(dir.display().to_string()), None).unwrap();
+            assert!(status.scan_complete, "{name}: {:?}", status.scan_failures);
+            assert!(status.needs_sync, "{name}");
+            let result =
+                sync_sessions_provider_inner(Some(dir.display().to_string()), None).unwrap();
+            assert!(
+                result.status.scan_complete && !result.status.needs_sync,
+                "{name}"
+            );
+            assert_eq!(result.updated_rollouts, 1, "{name}");
+            assert_eq!(thread_provider(&database, id), "custom", "{name}");
+            assert_eq!(catalog_provider(&catalog, id), "custom", "{name}");
+            let first_record = read_first_rollout_record(&rollout);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&first_record).unwrap()["payload"]
+                    ["model_provider"],
+                "custom"
+            );
+            assert_eq!(fs::metadata(&rollout).unwrap().len(), size, "{name}");
+            assert_eq!(
+                rollout_digest_from_offset(&rollout, first_record.len() as u64),
+                conversation_before,
+                "conversation bytes must be preserved: {name}"
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn streamed_ninety_seven_mib_single_chat_line_syncs_without_losing_conversation_bytes() {
+        let dir = temp_codex_dir("streamed-97-mib-chat-record");
+        write_config(&dir, "custom");
+        let id = "019f6000-0000-7000-8000-000000000709";
+        let rollout = write_rollout(&dir, id, "openai");
+        let first_record_len = read_first_rollout_record(&rollout).len() as u64;
+        let total_size = 97 * 1024 * 1024u64;
+        let prefix =
+            b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"";
+        let suffix = b"\"}}\n";
+        let mut file = fs::OpenOptions::new().append(true).open(&rollout).unwrap();
+        file.write_all(prefix).unwrap();
+        let mut remaining =
+            total_size - first_record_len - prefix.len() as u64 - suffix.len() as u64;
+        let body_chunk = [b'x'; 64 * 1024];
+        while remaining > 0 {
+            let count = remaining.min(body_chunk.len() as u64) as usize;
+            file.write_all(&body_chunk[..count]).unwrap();
+            remaining -= count as u64;
+        }
+        file.write_all(suffix).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let conversation_before = rollout_digest_from_offset(&rollout, first_record_len);
+        let database = dir.join("state_5.sqlite");
+        create_thread_database_with_rollout(&database, id, "openai", &rollout);
+        let catalog = dir.join("sqlite/codex-dev.db");
+        create_catalog_database(&catalog, &[(id, "openai")]);
+
+        let result = sync_sessions_provider_inner(Some(dir.display().to_string()), None)
+            .expect("a large valid single JSONL record must synchronize successfully");
+
+        assert!(
+            result.status.scan_complete && !result.status.needs_sync,
+            "{:?}",
+            result.status.scan_failures
+        );
+        assert_eq!(result.updated_rollouts, 1);
+        assert_eq!(thread_provider(&database, id), "custom");
+        assert_eq!(catalog_provider(&catalog, id), "custom");
+        let first_record = read_first_rollout_record(&rollout);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&first_record).unwrap()["payload"]
+                ["model_provider"],
+            "custom"
+        );
+        assert_eq!(fs::metadata(&rollout).unwrap().len(), total_size);
+        assert_eq!(
+            rollout_digest_from_offset(&rollout, first_record.len() as u64),
+            conversation_before,
+            "the large chat record must retain every original byte"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn streamed_multiple_rollouts_exceeding_legacy_snapshot_budget_sync_together() {
+        let dir = temp_codex_dir("streamed-multi-large-rollout-budget");
+        write_config(&dir, "custom");
+        let ids = [
+            "019f6000-0000-7000-8000-000000000711",
+            "019f6000-0000-7000-8000-000000000712",
+            "019f6000-0000-7000-8000-000000000713",
+        ];
+        let file_size = 45 * 1024 * 1024u64;
+        assert!(file_size * ids.len() as u64 > 128 * 1024 * 1024);
+        let mut rollouts = Vec::new();
+        let mut conversation_digests = Vec::new();
+        for id in ids {
+            let rollout = write_rollout(&dir, id, "openai");
+            let first_record_len = read_first_rollout_record(&rollout).len() as u64;
+            append_chat_record(&rollout);
+            pad_rollout_to_size(&rollout, file_size);
+            conversation_digests.push(rollout_digest_from_offset(&rollout, first_record_len));
+            rollouts.push(rollout);
+        }
+        let database = dir.join("state_5.sqlite");
+        create_thread_database_with_rollout(&database, ids[0], "openai", &rollouts[0]);
+        let conn = Connection::open(&database).unwrap();
+        for index in 1..ids.len() {
+            conn.execute(
+                "INSERT INTO threads (id, model_provider, title, rollout_path) VALUES (?1, 'openai', 'large history', ?2)",
+                (ids[index], rollouts[index].display().to_string()),
+            ).unwrap();
+        }
+        drop(conn);
+        let catalog = dir.join("sqlite/codex-dev.db");
+        create_catalog_database(&catalog, &ids.map(|id| (id, "openai")));
+
+        let result = sync_sessions_provider_inner(Some(dir.display().to_string()), None)
+            .expect("the combined size of valid rollouts must not block synchronization");
+
+        assert!(
+            result.status.scan_complete && !result.status.needs_sync,
+            "{:?}",
+            result.status.scan_failures
+        );
+        assert_eq!(result.updated_rollouts, ids.len());
+        for index in 0..ids.len() {
+            assert_eq!(thread_provider(&database, ids[index]), "custom");
+            assert_eq!(catalog_provider(&catalog, ids[index]), "custom");
+            let first_record = read_first_rollout_record(&rollouts[index]);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&first_record).unwrap()["payload"]
+                    ["model_provider"],
+                "custom"
+            );
+            assert_eq!(fs::metadata(&rollouts[index]).unwrap().len(), file_size);
+            assert_eq!(
+                rollout_digest_from_offset(&rollouts[index], first_record.len() as u64),
+                conversation_digests[index],
+                "conversation bytes must remain unchanged for {}",
+                ids[index]
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn large_invalid_jsonl_rollout_reports_parse_failure_and_keeps_indexes_unchanged() {
+        for (name, file_provider, database_provider) in [
+            ("file-and-index-old", "openai", "openai"),
+            ("index-already-target", "openai", "custom"),
+            ("first-record-matches", "custom", "custom"),
+        ] {
+            let dir = temp_codex_dir(name);
+            write_config(&dir, "custom");
+            let id = "019f6000-0000-7000-8000-000000000702";
+            let rollout = write_rollout(&dir, id, file_provider);
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&rollout)
+                .unwrap()
+                .set_len(LEGACY_LIMIT + 1)
+                .unwrap();
+            let before = rollout_digest(&rollout);
+            let database = dir.join("state_5.sqlite");
+            create_thread_database_with_rollout(&database, id, database_provider, &rollout);
+            let catalog = dir.join("sqlite/codex-dev.db");
+            create_catalog_database(&catalog, &[(id, database_provider)]);
+
+            let status = session_sync_status_inner(Some(dir.display().to_string()), None).unwrap();
+            assert!(!status.scan_complete, "{name}");
+            assert!(
+                status
+                    .scan_failures
+                    .iter()
+                    .any(|failure| failure.contains("JSONL")),
+                "{name}: {:?}",
+                status.scan_failures
+            );
+            let error =
+                sync_sessions_provider_inner(Some(dir.display().to_string()), None).unwrap_err();
+            assert!(error.to_string().contains("JSONL"), "{name}: {error}");
+            assert_eq!(thread_provider(&database, id), database_provider, "{name}");
+            assert_eq!(catalog_provider(&catalog, id), database_provider, "{name}");
+            assert_eq!(rollout_digest(&rollout), before, "{name}");
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn large_invalid_orphan_blocks_sync_without_changing_normal_logs_or_indexes() {
+        let dir = temp_codex_dir("large-invalid-orphan-blocked");
+        write_config(&dir, "custom");
+        let ordinary_id = "019f6000-0000-7000-8000-000000000703";
+        let ordinary = write_rollout(&dir, ordinary_id, "openai");
+        let before = fs::read(&ordinary).unwrap();
+        let database = dir.join("state_5.sqlite");
+        create_thread_database_with_rollout(&database, ordinary_id, "openai", &ordinary);
+        let catalog = dir.join("sqlite/codex-dev.db");
+        create_catalog_database(&catalog, &[(ordinary_id, "openai")]);
+        let orphan_id = "019f6000-0000-7000-8000-000000000704";
+        let invalid_orphan = write_rollout(&dir, orphan_id, "openai");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&invalid_orphan)
+            .unwrap()
+            .set_len(LEGACY_LIMIT + 1)
+            .unwrap();
+        let orphan_before = rollout_digest(&invalid_orphan);
+
+        let status = session_sync_status_inner(Some(dir.display().to_string()), None).unwrap();
+        assert!(!status.scan_complete && status.needs_sync);
+        let error =
+            sync_sessions_provider_inner(Some(dir.display().to_string()), None).unwrap_err();
+        assert!(error.to_string().contains("JSONL"), "{error}");
+        assert_eq!(fs::read(&ordinary).unwrap(), before);
+        assert_eq!(rollout_digest(&invalid_orphan), orphan_before);
+        assert_eq!(thread_provider(&database, ordinary_id), "openai");
+        assert_eq!(catalog_provider(&catalog, ordinary_id), "openai");
+        assert!(catalog_provider_and_visibility(&catalog, orphan_id).is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_orphan_read_or_parse_cannot_be_reported_as_successful_sync() {
+        for suffix in [b"\xff".as_slice(), b"not-json\n".as_slice()] {
+            let dir = temp_codex_dir("failed-orphan-check-blocks-sync");
+            write_config(&dir, "custom");
+            let id = "019f6000-0000-7000-8000-000000000705";
+            let ordinary = write_rollout(&dir, id, "openai");
+            let original = fs::read(&ordinary).unwrap();
+            let database = dir.join("state_5.sqlite");
+            create_thread_database_with_rollout(&database, id, "openai", &ordinary);
+            let catalog = dir.join("sqlite/codex-dev.db");
+            create_catalog_database(&catalog, &[(id, "openai")]);
+            let orphan = write_rollout(&dir, "019f6000-0000-7000-8000-000000000706", "openai");
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&orphan)
+                .unwrap()
+                .write_all(suffix)
+                .unwrap();
+            let orphan_original = fs::read(&orphan).unwrap();
+
+            let status = session_sync_status_inner(Some(dir.display().to_string()), None).unwrap();
+            assert!(!status.scan_complete && !status.scan_failures.is_empty());
+            assert!(sync_sessions_provider_inner(Some(dir.display().to_string()), None).is_err());
+            assert_eq!(thread_provider(&database, id), "openai");
+            assert_eq!(catalog_provider(&catalog, id), "openai");
+            assert_eq!(fs::read(&ordinary).unwrap(), original);
+            assert_eq!(fs::read(&orphan).unwrap(), orphan_original);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_final_recheck_rolls_back_committed_logs_and_indexes() {
+        for scenario in ["invalid", "large-invalid", "new-mismatch"] {
+            let dir = temp_codex_dir("failed-final-recheck");
+            write_config(&dir, "custom");
+            let id = "019f6000-0000-7000-8000-000000000707";
+            let ordinary = write_rollout(&dir, id, "openai");
+            let original = fs::read(&ordinary).unwrap();
+            let database = dir.join("state_5.sqlite");
+            create_thread_database_with_rollout(&database, id, "openai", &ordinary);
+            let catalog = dir.join("sqlite/codex-dev.db");
+            create_catalog_database(&catalog, &[(id, "openai")]);
+            let late = dir.join("sessions/rollout-test-019f6000-0000-7000-8000-000000000708.jsonl");
+            let mut late_digest = None;
+
+            let error =
+                sync_sessions_provider_with_hook(Some(dir.display().to_string()), None, |point| {
+                    if matches!(point, MutationPoint::AfterSqliteCommit(_)) && !late.exists() {
+                        if scenario == "invalid" {
+                            fs::write(&late, b"\xff").unwrap();
+                        } else {
+                            write_rollout_at(
+                                &late,
+                                "019f6000-0000-7000-8000-000000000708",
+                                "openai",
+                            );
+                            if scenario == "large-invalid" {
+                                fs::OpenOptions::new()
+                                    .write(true)
+                                    .open(&late)
+                                    .unwrap()
+                                    .set_len(LEGACY_LIMIT + 1)
+                                    .unwrap();
+                            }
+                        }
+                        late_digest = Some(rollout_digest(&late));
+                    }
+                    Ok(())
+                })
+                .expect_err("a failed final check must not return a successful sync");
+
+            assert!(
+                error.to_string().contains("同步后复查未通过"),
+                "{scenario}: {error}"
+            );
+            assert_eq!(thread_provider(&database, id), "openai", "{scenario}");
+            assert_eq!(catalog_provider(&catalog, id), "openai", "{scenario}");
+            assert_eq!(fs::read(&ordinary).unwrap(), original, "{scenario}");
+            assert_eq!(
+                rollout_digest(&late),
+                late_digest.unwrap(),
+                "preserve external file: {scenario}"
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     fn write_subagent_rollout(
@@ -975,7 +1372,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_standard_orphan_rollout_does_not_block_active_sessions() {
+    fn malformed_standard_orphan_keeps_check_incomplete_without_mutation() {
         let codex_dir = temp_codex_dir("malformed-standard-orphan");
         write_config(&codex_dir, SHARED_SESSION_PROVIDER);
         let active_id = "019f6000-0000-7000-8000-000000000502";
@@ -985,26 +1382,30 @@ mod tests {
             active_id,
             SHARED_SESSION_PROVIDER,
         );
-        write_rollout(&codex_dir, active_id, SHARED_SESSION_PROVIDER);
-        fs::write(
-            codex_dir.join(format!("sessions/rollout-test-{orphan_id}.jsonl")),
-            b"\xff",
-        )
-        .expect("write invalid orphan rollout");
+        let active = write_rollout(&codex_dir, active_id, SHARED_SESSION_PROVIDER);
+        let active_before = fs::read(&active).unwrap();
+        let database = codex_dir.join("state_5.sqlite");
+        let database_before = fs::read(&database).unwrap();
+        let orphan = codex_dir.join(format!("sessions/rollout-test-{orphan_id}.jsonl"));
+        fs::write(&orphan, b"\xff").expect("write invalid orphan rollout");
 
         let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
             .expect("scan active sessions only");
-        assert!(status.scan_complete, "{:?}", status.scan_failures);
+        assert!(!status.scan_complete);
+        assert!(!status.scan_failures.is_empty());
         assert_eq!(status.rollout_files, 2);
         assert_eq!(status.session_meta_count, 1);
         assert!(!status.needs_sync);
-        assert_eq!(status.warnings.len(), 1);
+        assert!(sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None).is_err());
+        assert_eq!(fs::read(&active).unwrap(), active_before);
+        assert_eq!(fs::read(&database).unwrap(), database_before);
+        assert_eq!(fs::read(&orphan).unwrap(), b"\xff");
 
         fs::remove_dir_all(codex_dir).expect("remove test directory");
     }
 
     #[test]
-    fn malformed_unreferenced_nonstandard_rollout_does_not_block_active_sessions() {
+    fn malformed_unreferenced_rollout_keeps_check_incomplete_without_mutation() {
         let codex_dir = temp_codex_dir("malformed-unreferenced-rollout");
         write_config(&codex_dir, SHARED_SESSION_PROVIDER);
         let active_id = "019f6000-0000-7000-8000-000000000504";
@@ -1013,19 +1414,23 @@ mod tests {
             active_id,
             SHARED_SESSION_PROVIDER,
         );
-        write_rollout(&codex_dir, active_id, SHARED_SESSION_PROVIDER);
-        fs::write(
-            codex_dir.join("sessions/rollout-imported-orphan.jsonl"),
-            b"\xff",
-        )
-        .expect("write invalid unreferenced rollout");
+        let active = write_rollout(&codex_dir, active_id, SHARED_SESSION_PROVIDER);
+        let active_before = fs::read(&active).unwrap();
+        let database = codex_dir.join("state_5.sqlite");
+        let database_before = fs::read(&database).unwrap();
+        let orphan = codex_dir.join("sessions/rollout-imported-orphan.jsonl");
+        fs::write(&orphan, b"\xff").expect("write invalid unreferenced rollout");
 
         let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
             .expect("scan referenced sessions only");
-        assert!(status.scan_complete, "{:?}", status.scan_failures);
+        assert!(!status.scan_complete);
+        assert!(!status.scan_failures.is_empty());
         assert_eq!(status.rollout_files, 2);
         assert_eq!(status.session_meta_count, 1);
-        assert_eq!(status.warnings.len(), 1);
+        assert!(sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None).is_err());
+        assert_eq!(fs::read(&active).unwrap(), active_before);
+        assert_eq!(fs::read(&database).unwrap(), database_before);
+        assert_eq!(fs::read(&orphan).unwrap(), b"\xff");
 
         fs::remove_dir_all(codex_dir).expect("remove test directory");
     }

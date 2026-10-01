@@ -2,12 +2,15 @@ use super::*;
 use crate::sessions::backup::provider_sync_backup_root;
 use crate::sessions::sync::sync_sessions_provider_with_hook;
 use rusqlite::{Connection, OpenFlags};
+use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+
+const LARGE_ROLLOUT_TEST_BYTES: u64 = 33 * 1024 * 1024;
 
 fn temp_dir(name: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -71,6 +74,633 @@ fn sqlite_quick_check(path: &Path) -> String {
         .expect("open sqlite for quick check")
         .query_row("PRAGMA quick_check", [], |row| row.get(0))
         .expect("run quick check")
+}
+
+struct RolloutFailureFixture {
+    codex_dir: PathBuf,
+    ids: [&'static str; 2],
+    rollouts: [PathBuf; 2],
+    originals: [Vec<u8>; 2],
+    database: PathBuf,
+    catalog: PathBuf,
+}
+
+impl RolloutFailureFixture {
+    fn new(name: &str) -> Self {
+        let codex_dir = temp_dir(name);
+        let ids = [
+            "019f6000-0000-7000-8000-000000000991",
+            "019f6000-0000-7000-8000-000000000992",
+        ];
+        let rollouts = ids.map(|id| codex_dir.join(format!("sessions/rollout-test-{id}.jsonl")));
+        let originals = std::array::from_fn(|index| write_rollout(&rollouts[index], ids[index]));
+        let database = codex_dir.join("state_10.sqlite");
+        create_thread_database(&database, ids[0], &rollouts[0]);
+        Connection::open(&database)
+            .unwrap()
+            .execute(
+                "INSERT INTO threads (id, model_provider, rollout_path) VALUES (?1, 'openai', ?2)",
+                (ids[1], rollouts[1].display().to_string()),
+            )
+            .unwrap();
+        let catalog = codex_dir.join("sqlite/codex-dev.db");
+        fs::create_dir_all(catalog.parent().unwrap()).unwrap();
+        let conn = Connection::open(&catalog).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE local_thread_catalog (
+                host_id TEXT NOT NULL, thread_id TEXT NOT NULL, model_provider TEXT NOT NULL,
+                PRIMARY KEY (host_id, thread_id));
+             CREATE TABLE local_thread_catalog_metadata (
+                id INTEGER PRIMARY KEY, catalog_revision INTEGER NOT NULL);
+             INSERT INTO local_thread_catalog_metadata VALUES (1, 7);",
+        )
+        .unwrap();
+        for id in ids {
+            conn.execute(
+                "INSERT INTO local_thread_catalog VALUES ('local', ?1, 'openai')",
+                [id],
+            )
+            .unwrap();
+        }
+        Self {
+            codex_dir,
+            ids,
+            rollouts,
+            originals,
+            database,
+            catalog,
+        }
+    }
+
+    fn scan(&self) -> RolloutScan {
+        let changes = (0..2)
+            .map(|index| {
+                let original_text = String::from_utf8(self.originals[index].clone()).unwrap();
+                SessionFileChange {
+                    path: self.rollouts[index].clone(),
+                    next_text: original_text.replace("\"openai\"", "\"custom\""),
+                    original_text,
+                    original_mtime: None,
+                    streamed: None,
+                }
+            })
+            .collect();
+        RolloutScan {
+            changes,
+            provider_candidate_paths: self.rollouts.iter().cloned().collect(),
+            verified_rollout_hashes: (0..2)
+                .map(|index| {
+                    (
+                        self.rollouts[index].clone(),
+                        Sha256::digest(&self.originals[index]).into(),
+                    )
+                })
+                .collect(),
+            ..RolloutScan::default()
+        }
+    }
+
+    fn set_rollouts_to_target_provider(&mut self) {
+        for index in 0..2 {
+            self.originals[index] = String::from_utf8(self.originals[index].clone())
+                .unwrap()
+                .replace("\"openai\"", "\"custom\"")
+                .into_bytes();
+            fs::write(&self.rollouts[index], &self.originals[index]).unwrap();
+        }
+    }
+
+    fn catalog_provider(&self, id: &str) -> String {
+        Connection::open(&self.catalog)
+            .unwrap()
+            .query_row(
+                "SELECT model_provider FROM local_thread_catalog WHERE thread_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn assert_databases_unchanged(&self) {
+        for id in self.ids {
+            assert_eq!(thread_provider(&self.database, id), "openai");
+            assert_eq!(self.catalog_provider(id), "openai");
+        }
+        let (rows, revision): (i64, i64) = Connection::open(&self.catalog)
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM local_thread_catalog),
+                (SELECT catalog_revision FROM local_thread_catalog_metadata WHERE id = 1)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((rows, revision), (2, 7));
+    }
+
+    fn sync_with_hook<F>(&self, hook: F) -> Result<super::super::types::SessionSyncResult>
+    where
+        F: FnMut(MutationPoint) -> Result<()>,
+    {
+        sync_sessions_provider_with_hook(Some(self.codex_dir.display().to_string()), None, hook)
+    }
+}
+
+impl Drop for RolloutFailureFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.codex_dir);
+    }
+}
+
+#[test]
+fn blocked_rollout_scan_aborts_before_hooks_or_database_updates() {
+    let fixture = RolloutFailureFixture::new("bounded-blocked-scan");
+    let mut rollouts = fixture.scan();
+    rollouts
+        .blocked_failures
+        .push("会话文件读取失败，未完成扫描".to_string());
+    let mut pending =
+        prepare_sqlite_updates(&[fixture.database.clone(), fixture.catalog.clone()]).unwrap();
+    let mut journal = MutationJournal::default();
+    let mut hook_called = false;
+    let error = execute_provider_sync_mutation(
+        &rollouts,
+        &mut pending,
+        "custom",
+        &HashMap::new(),
+        &fixture.ids.map(str::to_string).into_iter().collect(),
+        &mut journal,
+        &mut |_| {
+            hook_called = true;
+            Ok(())
+        },
+    )
+    .err()
+    .expect("blocked scan must fail");
+    assert!(error.to_string().contains("读取失败"));
+    assert!(!hook_called);
+    assert!(journal.applied_rollouts.is_empty());
+    assert!(rollback_mutation(&journal, &mut pending).is_empty());
+    fixture.assert_databases_unchanged();
+    for index in 0..2 {
+        assert_eq!(
+            fs::read(&fixture.rollouts[index]).unwrap(),
+            fixture.originals[index]
+        );
+    }
+}
+
+#[test]
+fn concurrent_rollout_change_is_rejected_before_file_or_database_updates() {
+    let fixture = RolloutFailureFixture::new("bounded-skip-rollback");
+    let mut external = fixture.originals[1].clone();
+    external.extend_from_slice(
+        b"{\"type\":\"event_msg\",\"payload\":{\"message\":\"keep-new-data\"}}\n",
+    );
+    let error = fixture
+        .sync_with_hook(|point| {
+            if point == MutationPoint::BeforeRolloutMutation {
+                fs::write(&fixture.rollouts[1], &external).unwrap();
+            }
+            Ok(())
+        })
+        .expect_err("any skipped rollout must abort the full sync");
+    assert!(error.to_string().contains("已停止同步"), "{error}");
+    fixture.assert_databases_unchanged();
+    assert_eq!(
+        fs::read(&fixture.rollouts[0]).unwrap(),
+        fixture.originals[0]
+    );
+    assert_eq!(fs::read(&fixture.rollouts[1]).unwrap(), external);
+}
+
+#[test]
+fn skipped_rollout_after_first_write_rolls_back_and_never_updates_indexes() {
+    let fixture = RolloutFailureFixture::new("streamed-skip-after-write");
+    let mut external = fixture.originals[1].clone();
+    external.extend_from_slice(
+        b"{\"type\":\"event_msg\",\"payload\":{\"message\":\"keep-external-data\"}}\n",
+    );
+    let mut first_write_observed = false;
+    let error = fixture
+        .sync_with_hook(|point| {
+            if point == MutationPoint::BeforeEachRolloutMutation(1) {
+                first_write_observed = fs::read_to_string(&fixture.rollouts[0])
+                    .unwrap()
+                    .contains("custom");
+                fs::write(&fixture.rollouts[1], &external).unwrap();
+            }
+            Ok(())
+        })
+        .expect_err("a skipped second rollout must fail and roll back the first write");
+    assert!(first_write_observed);
+    assert!(error.to_string().contains("已停止同步"), "{error}");
+    fixture.assert_databases_unchanged();
+    assert_eq!(
+        fs::read(&fixture.rollouts[0]).unwrap(),
+        fixture.originals[0]
+    );
+    assert_eq!(fs::read(&fixture.rollouts[1]).unwrap(), external);
+}
+
+#[test]
+fn rollout_read_failure_after_scan_aborts_without_database_updates() {
+    let fixture = RolloutFailureFixture::new("bounded-read-failure");
+    let error = fixture
+        .sync_with_hook(|point| {
+            if point == MutationPoint::BeforeRolloutMutation {
+                fs::remove_file(&fixture.rollouts[1]).unwrap();
+            }
+            Ok(())
+        })
+        .expect_err("unreadable full rollout must fail the sync");
+    assert!(error.to_string().contains(fixture.ids[1]), "{error}");
+    fixture.assert_databases_unchanged();
+    assert_eq!(
+        fs::read(&fixture.rollouts[0]).unwrap(),
+        fixture.originals[0]
+    );
+    assert!(
+        !fixture.rollouts[1].exists(),
+        "external deletion must be preserved"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rollout_atomic_write_failure_restores_earlier_files_without_database_updates() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut fixture = RolloutFailureFixture::new("streaming-write-failure");
+    let blocked_parent = fixture.codex_dir.join("sessions/zz-write-blocked");
+    fs::create_dir_all(&blocked_parent).unwrap();
+    let second_path = blocked_parent.join(fixture.rollouts[1].file_name().unwrap());
+    fs::rename(&fixture.rollouts[1], &second_path).unwrap();
+    fixture.rollouts[1] = second_path;
+    Connection::open(&fixture.database)
+        .unwrap()
+        .execute(
+            "UPDATE threads SET rollout_path = ?1 WHERE id = ?2",
+            (fixture.rollouts[1].display().to_string(), fixture.ids[1]),
+        )
+        .unwrap();
+    let mut reached_file_mutation = false;
+    let result = fixture.sync_with_hook(|point| {
+        if point == MutationPoint::BeforeEachRolloutMutation(1) {
+            reached_file_mutation = true;
+            fs::set_permissions(&blocked_parent, fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        Ok(())
+    });
+    // Always restore the temporary fixture permissions before assertions/drop.
+    fs::set_permissions(&blocked_parent, fs::Permissions::from_mode(0o700)).unwrap();
+    let error = result.expect_err("temporary rollout write permission failure must fail sync");
+    assert!(
+        reached_file_mutation,
+        "failure must occur after scan and backup"
+    );
+    assert!(error.to_string().contains("IO error"), "{error}");
+    fixture.assert_databases_unchanged();
+    for index in 0..2 {
+        assert_eq!(
+            fs::read(&fixture.rollouts[index]).unwrap(),
+            fixture.originals[index]
+        );
+    }
+}
+
+#[test]
+fn ordinary_provider_rewrite_after_mutation_aborts_without_database_or_catalog_changes() {
+    let fixture = RolloutFailureFixture::new("bounded-provider-race");
+    let external = fixture.originals[1].clone();
+    let error = fixture
+        .sync_with_hook(|point| {
+            if point == MutationPoint::AfterRolloutMutation {
+                assert!(fs::read_to_string(&fixture.rollouts[0])
+                    .unwrap()
+                    .contains("\"custom\""));
+                assert!(fs::read_to_string(&fixture.rollouts[1])
+                    .unwrap()
+                    .contains("\"custom\""));
+                fs::write(&fixture.rollouts[1], &external).unwrap();
+            }
+            Ok(())
+        })
+        .expect_err("ordinary provider change after writes must fail sync");
+    assert!(error.to_string().contains("会话文件已发生变化"), "{error}");
+    fixture.assert_databases_unchanged();
+    assert_eq!(
+        fs::read(&fixture.rollouts[0]).unwrap(),
+        fixture.originals[0]
+    );
+    assert_eq!(fs::read(&fixture.rollouts[1]).unwrap(), external);
+}
+
+#[test]
+fn rollout_snapshot_is_rechecked_before_each_database_commit() {
+    let fixture = RolloutFailureFixture::new("bounded-between-commits");
+    let mut first_committed = false;
+    let error = fixture
+        .sync_with_hook(|point| {
+            if point == MutationPoint::AfterSqliteCommit(0) {
+                first_committed = true;
+                assert!(
+                    thread_provider(&fixture.database, fixture.ids[0]) == "custom"
+                        || fixture.catalog_provider(fixture.ids[0]) == "custom"
+                );
+                fs::write(&fixture.rollouts[1], &fixture.originals[1]).unwrap();
+            }
+            Ok(())
+        })
+        .expect_err("new rollout data before the second commit must abort and restore the first");
+    assert!(first_committed);
+    assert!(error.to_string().contains("会话文件已发生变化"), "{error}");
+    fixture.assert_databases_unchanged();
+    for index in 0..2 {
+        assert_eq!(
+            fs::read(&fixture.rollouts[index]).unwrap(),
+            fixture.originals[index]
+        );
+    }
+}
+
+#[test]
+fn rollout_growth_after_scan_is_not_overwritten_or_reported_as_success() {
+    let fixture = RolloutFailureFixture::new("bounded-growth-before-mutation");
+    let enlarged_len = LARGE_ROLLOUT_TEST_BYTES;
+    let error = fixture
+        .sync_with_hook(|point| {
+            if point == MutationPoint::BeforeRolloutMutation {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&fixture.rollouts[1])
+                    .unwrap()
+                    .set_len(enlarged_len)
+                    .unwrap();
+            }
+            Ok(())
+        })
+        .expect_err("concurrent growth must invalidate the verified snapshot");
+    assert!(error.to_string().contains("会话文件已发生变化"), "{error}");
+    fixture.assert_databases_unchanged();
+    assert_eq!(
+        fs::read(&fixture.rollouts[0]).unwrap(),
+        fixture.originals[0]
+    );
+    assert_eq!(
+        fs::metadata(&fixture.rollouts[1]).unwrap().len(),
+        enlarged_len
+    );
+}
+
+#[test]
+fn rollout_growth_after_file_writes_preserves_external_data_and_rolls_back_other_files() {
+    let fixture = RolloutFailureFixture::new("bounded-growth-after-mutation");
+    let marker = b"keep-external-growth";
+    let marker_offset = LARGE_ROLLOUT_TEST_BYTES;
+    let enlarged_len = marker_offset + marker.len() as u64;
+    let error = fixture
+        .sync_with_hook(|point| {
+            if point == MutationPoint::AfterRolloutMutation {
+                let mut external = fs::OpenOptions::new()
+                    .write(true)
+                    .open(&fixture.rollouts[1])
+                    .unwrap();
+                external.set_len(enlarged_len).unwrap();
+                external.seek(SeekFrom::Start(marker_offset)).unwrap();
+                external.write_all(marker).unwrap();
+            }
+            Ok(())
+        })
+        .expect_err("growth after writes must prevent all database commits");
+    assert!(error.to_string().contains("会话文件已发生变化"), "{error}");
+    fixture.assert_databases_unchanged();
+    assert_eq!(
+        fs::read(&fixture.rollouts[0]).unwrap(),
+        fixture.originals[0]
+    );
+    assert_eq!(
+        fs::metadata(&fixture.rollouts[1]).unwrap().len(),
+        enlarged_len
+    );
+    let mut preserved = fs::File::open(&fixture.rollouts[1]).unwrap();
+    preserved.seek(SeekFrom::Start(marker_offset)).unwrap();
+    let mut restored_marker = vec![0; marker.len()];
+    preserved.read_exact(&mut restored_marker).unwrap();
+    assert_eq!(restored_marker, marker);
+}
+
+#[test]
+fn rollout_read_failure_after_writes_restores_other_files_and_preserves_external_content() {
+    let fixture = RolloutFailureFixture::new("bounded-read-failure-after-writes");
+    let error = fixture
+        .sync_with_hook(|point| {
+            if point == MutationPoint::AfterRolloutMutation {
+                fs::remove_file(&fixture.rollouts[1]).unwrap();
+            }
+            Ok(())
+        })
+        .expect_err("full snapshot read failure after writes must abort the sync");
+    assert!(error.to_string().contains(fixture.ids[1]), "{error}");
+    fixture.assert_databases_unchanged();
+    assert_eq!(
+        fs::read(&fixture.rollouts[0]).unwrap(),
+        fixture.originals[0]
+    );
+    assert!(
+        !fixture.rollouts[1].exists(),
+        "external deletion must be preserved"
+    );
+}
+
+#[test]
+fn unchanged_candidate_without_verified_hash_is_rejected_before_mutation() {
+    let fixture = RolloutFailureFixture::new("bounded-unverified-candidate");
+    let mut rollouts = fixture.scan();
+    rollouts.changes.clear();
+    rollouts.verified_rollout_hashes.clear();
+    let mut pending =
+        prepare_sqlite_updates(&[fixture.database.clone(), fixture.catalog.clone()]).unwrap();
+    let mut journal = MutationJournal::default();
+    let mut hook_called = false;
+    let error = execute_provider_sync_mutation(
+        &rollouts,
+        &mut pending,
+        "custom",
+        &HashMap::new(),
+        &fixture.ids.map(str::to_string).into_iter().collect(),
+        &mut journal,
+        &mut |_| {
+            hook_called = true;
+            Ok(())
+        },
+    )
+    .err()
+    .expect("unverified candidate must not take a fresh mutable file as its baseline");
+    assert!(
+        error.to_string().contains("缺少会话文件验证快照"),
+        "{error}"
+    );
+    assert!(!hook_called);
+    fixture.assert_databases_unchanged();
+}
+
+#[test]
+fn unchanged_candidates_normally_repair_databases_without_rewriting_rollouts() {
+    let mut fixture = RolloutFailureFixture::new("bounded-matched-normal-repair");
+    fixture.set_rollouts_to_target_provider();
+    let result = fixture
+        .sync_with_hook(|_| Ok(()))
+        .expect("matched verified logs permit database repair");
+    assert_eq!(result.updated_rollouts, 0);
+    assert!(result.updated_threads > 0);
+    for index in 0..2 {
+        assert_eq!(
+            thread_provider(&fixture.database, fixture.ids[index]),
+            "custom"
+        );
+        assert_eq!(fixture.catalog_provider(fixture.ids[index]), "custom");
+        assert_eq!(
+            fs::read(&fixture.rollouts[index]).unwrap(),
+            fixture.originals[index]
+        );
+    }
+}
+
+#[test]
+fn large_unchanged_candidate_repairs_databases_without_rewriting_the_file() {
+    let mut fixture = RolloutFailureFixture::new("streamed-large-matched-repair");
+    fixture.set_rollouts_to_target_provider();
+    let event = b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"unchanged large history\"}}\n";
+    let chunk = event.repeat(512);
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&fixture.rollouts[1])
+        .unwrap();
+    let mut original_len = file.metadata().unwrap().len();
+    while original_len <= LARGE_ROLLOUT_TEST_BYTES {
+        file.write_all(&chunk).unwrap();
+        original_len += chunk.len() as u64;
+    }
+    file.sync_all().unwrap();
+    drop(file);
+    let original_hash = hash_rollout_file(&fixture.rollouts[1]).unwrap();
+
+    let result = fixture
+        .sync_with_hook(|_| Ok(()))
+        .expect("large matched files permit database repair");
+    assert_eq!(result.updated_rollouts, 0);
+    assert!(result.updated_threads > 0);
+    for id in fixture.ids {
+        assert_eq!(thread_provider(&fixture.database, id), "custom");
+        assert_eq!(fixture.catalog_provider(id), "custom");
+    }
+    assert_eq!(
+        fs::metadata(&fixture.rollouts[1]).unwrap().len(),
+        original_len
+    );
+    assert_eq!(
+        hash_rollout_file(&fixture.rollouts[1]).unwrap(),
+        original_hash
+    );
+}
+
+#[test]
+fn unchanged_candidate_provider_changes_before_or_after_mutation_block_database_repair() {
+    for stage in [
+        MutationPoint::BeforeRolloutMutation,
+        MutationPoint::AfterRolloutMutation,
+    ] {
+        let mut fixture = RolloutFailureFixture::new("bounded-matched-provider-race");
+        fixture.set_rollouts_to_target_provider();
+        let external = String::from_utf8(fixture.originals[1].clone())
+            .unwrap()
+            .replace("\"custom\"", "\"openai\"")
+            .into_bytes();
+        let error = fixture
+            .sync_with_hook(|point| {
+                if point == stage {
+                    fs::write(&fixture.rollouts[1], &external).unwrap();
+                }
+                Ok(())
+            })
+            .expect_err("changed already-matched candidate must not permit database repair");
+        assert!(error.to_string().contains("会话文件已发生变化"), "{error}");
+        fixture.assert_databases_unchanged();
+        assert_eq!(
+            fs::read(&fixture.rollouts[0]).unwrap(),
+            fixture.originals[0]
+        );
+        assert_eq!(fs::read(&fixture.rollouts[1]).unwrap(), external);
+    }
+}
+
+#[test]
+fn unchanged_candidate_growth_before_or_after_mutation_blocks_database_repair() {
+    for stage in [
+        MutationPoint::BeforeRolloutMutation,
+        MutationPoint::AfterRolloutMutation,
+    ] {
+        let mut fixture = RolloutFailureFixture::new("bounded-matched-growth-race");
+        fixture.set_rollouts_to_target_provider();
+        let enlarged_len = LARGE_ROLLOUT_TEST_BYTES;
+        let error = fixture
+            .sync_with_hook(|point| {
+                if point == stage {
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(&fixture.rollouts[1])
+                        .unwrap()
+                        .set_len(enlarged_len)
+                        .unwrap();
+                }
+                Ok(())
+            })
+            .expect_err("changed already-matched candidate must prevent database repair");
+        assert!(error.to_string().contains("会话文件已发生变化"), "{error}");
+        fixture.assert_databases_unchanged();
+        assert_eq!(
+            fs::read(&fixture.rollouts[0]).unwrap(),
+            fixture.originals[0]
+        );
+        assert_eq!(
+            fs::metadata(&fixture.rollouts[1]).unwrap().len(),
+            enlarged_len
+        );
+        let mut external = fs::File::open(&fixture.rollouts[1]).unwrap();
+        let mut prefix = vec![0; fixture.originals[1].len()];
+        external.read_exact(&mut prefix).unwrap();
+        assert_eq!(prefix, fixture.originals[1]);
+    }
+}
+
+#[test]
+fn unchanged_candidate_change_after_final_commit_rolls_back_databases_and_preserves_external_log() {
+    let mut fixture = RolloutFailureFixture::new("bounded-matched-final-commit-race");
+    fixture.set_rollouts_to_target_provider();
+    let external = String::from_utf8(fixture.originals[1].clone())
+        .unwrap()
+        .replace("\"custom\"", "\"openai\"")
+        .into_bytes();
+    let mut last_commit_observed = false;
+    let error = fixture
+        .sync_with_hook(|point| {
+            if point == MutationPoint::AfterSqliteCommit(1) {
+                last_commit_observed = true;
+                assert_eq!(thread_provider(&fixture.database, fixture.ids[0]), "custom");
+                assert_eq!(fixture.catalog_provider(fixture.ids[0]), "custom");
+                fs::write(&fixture.rollouts[1], &external).unwrap();
+            }
+            Ok(())
+        })
+        .expect_err("the final commit hook must not bypass the complete snapshot validation");
+    assert!(last_commit_observed);
+    assert!(error.to_string().contains("会话文件已发生变化"), "{error}");
+    fixture.assert_databases_unchanged();
+    assert_eq!(
+        fs::read(&fixture.rollouts[0]).unwrap(),
+        fixture.originals[0]
+    );
+    assert_eq!(fs::read(&fixture.rollouts[1]).unwrap(), external);
 }
 
 #[test]
